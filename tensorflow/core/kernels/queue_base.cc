@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,9 +26,11 @@ namespace tensorflow {
 namespace {
 
 template <DataType DT>
-Status HandleSliceToElement(const Tensor& parent, Tensor* element, int index) {
+Status HandleSliceToElement(const Tensor& parent, Tensor* element,
+                            int64 index) {
   typedef typename EnumToDataType<DT>::Type T;
   DCHECK_NE(parent.dim_size(0), 0);
+  DCHECK_GE(index, 0);
   if (element->NumElements() != (parent.NumElements() / parent.dim_size(0))) {
     TensorShape chip_shape = parent.shape();
     chip_shape.RemoveDim(0);
@@ -47,6 +49,7 @@ template <DataType DT>
 Status HandleElementToSlice(const Tensor& element, Tensor* parent, int index) {
   typedef typename EnumToDataType<DT>::Type T;
   DCHECK_NE(parent->dim_size(0), 0);
+  DCHECK_GE(index, 0);
   if (element.NumElements() != (parent->NumElements() / parent->dim_size(0))) {
     TensorShape chip_shape = parent->shape();
     chip_shape.RemoveDim(0);
@@ -349,13 +352,14 @@ void QueueBase::FlushUnlocked() {
 }
 
 Status QueueBase::CopySliceToElement(const Tensor& parent, Tensor* element,
-                                     int index) {
+                                     int64 index) {
 #define HANDLE_TYPE(DT)                                                   \
   if (parent.dtype() == DT) {                                             \
     TF_RETURN_IF_ERROR(HandleSliceToElement<DT>(parent, element, index)); \
     return Status::OK();                                                  \
   }
   HANDLE_TYPE(DT_FLOAT);
+  HANDLE_TYPE(DT_HALF);
   HANDLE_TYPE(DT_DOUBLE);
   HANDLE_TYPE(DT_INT32);
   HANDLE_TYPE(DT_UINT8);
@@ -363,6 +367,7 @@ Status QueueBase::CopySliceToElement(const Tensor& parent, Tensor* element,
   HANDLE_TYPE(DT_INT8);
   HANDLE_TYPE(DT_STRING);
   HANDLE_TYPE(DT_COMPLEX64);
+  HANDLE_TYPE(DT_COMPLEX128);
   HANDLE_TYPE(DT_INT64);
   HANDLE_TYPE(DT_BOOL);
   HANDLE_TYPE(DT_QINT8);
@@ -377,13 +382,14 @@ Status QueueBase::CopySliceToElement(const Tensor& parent, Tensor* element,
 
 // Static method
 Status QueueBase::CopyElementToSlice(const Tensor& element, Tensor* parent,
-                                     int index) {
+                                     int64 index) {
 #define HANDLE_TYPE(DT)                                                   \
   if (element.dtype() == DT) {                                            \
     TF_RETURN_IF_ERROR(HandleElementToSlice<DT>(element, parent, index)); \
     return Status::OK();                                                  \
   }
   HANDLE_TYPE(DT_FLOAT);
+  HANDLE_TYPE(DT_HALF);
   HANDLE_TYPE(DT_DOUBLE);
   HANDLE_TYPE(DT_INT32);
   HANDLE_TYPE(DT_UINT8);
@@ -391,6 +397,7 @@ Status QueueBase::CopyElementToSlice(const Tensor& element, Tensor* parent,
   HANDLE_TYPE(DT_INT8);
   HANDLE_TYPE(DT_STRING);
   HANDLE_TYPE(DT_COMPLEX64);
+  HANDLE_TYPE(DT_COMPLEX128);
   HANDLE_TYPE(DT_INT64);
   HANDLE_TYPE(DT_BOOL);
   HANDLE_TYPE(DT_QINT8);

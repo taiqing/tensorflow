@@ -63,6 +63,7 @@ cc_library(
 )
 
 tf_cc_tests(
+    size = "small",
     tests = [
         "ctc_beam_search_test.cc",
     ],
@@ -84,6 +85,7 @@ cc_library(
     ],
     deps = [
         ":ctc_loss_util_lib",
+        "//tensorflow/core:framework",
         "//tensorflow/core:lib",
         "//third_party/eigen3",
     ],

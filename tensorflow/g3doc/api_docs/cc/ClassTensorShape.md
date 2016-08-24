@@ -60,6 +60,18 @@ Copy the specified shape.
 
 
 
+#### `tensorflow::TensorShape::TensorShape(TensorShape &&b)` {#tensorflow_TensorShape_TensorShape}
+
+Move the specified shape. After moving, is safe for destruction and.
+
+
+
+#### `void tensorflow::TensorShape::operator=(TensorShape &&b)` {#void_tensorflow_TensorShape_operator_}
+
+
+
+
+
 #### `void tensorflow::TensorShape::Clear()` {#void_tensorflow_TensorShape_Clear}
 
 Clear a tensor shape.
@@ -191,6 +203,12 @@ Returns `true` iff `proto` is a valid tensor shape.
 
 
 Returns `OK` iff `proto` is a valid tensor shape, and a descriptive error status otherwise.
+
+#### `static constexpr int tensorflow::TensorShape::MaxDimensions()` {#static_constexpr_int_tensorflow_TensorShape_MaxDimensions}
+
+
+
+
 
 #### `string tensorflow::TensorShape::DebugString(const TensorShapeProto &proto)` {#string_tensorflow_TensorShape_DebugString}
 

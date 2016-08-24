@@ -29,7 +29,7 @@ to:
 
 [TOC]
 
-## Define the Op's interface 
+## Define the Op's interface
 
 You define the interface of an Op by registering it with the TensorFlow system.
 In the registration, you specify the name of your Op, its inputs (types and
@@ -63,6 +63,12 @@ overrides the `Compute` method. The `Compute` method provides one `context`
 argument of type `OpKernelContext*`, from which you can access useful things
 like the input and output tensors.
 
+> Important note: Instances of your OpKernel may be accessed concurrently. Your
+> `Compute` method must be thread-safe. Guard any access to class members with a
+> mutex (Or better yet, don't share state via class members! Consider using a
+> [`ResourceMgr`](https://www.tensorflow.org/code/tensorflow/core/framework/resource_mgr.h)
+> to keep track of Op state).
+
 Add your kernel to the file you created above. The kernel might look something
 like this:
 
@@ -84,7 +90,7 @@ class ZeroOutOp : public OpKernel {
     Tensor* output_tensor = NULL;
     OP_REQUIRES_OK(context, context->allocate_output(0, input_tensor.shape(),
                                                      &output_tensor));
-    auto output = output_tensor->template flat<int32>();
+    auto output = output_tensor->flat<int32>();
 
     // Set all but the first element of the output tensor to 0.
     const int N = input.size();
@@ -115,18 +121,15 @@ REGISTER_KERNEL_BUILDER(Name("ZeroOut").Device(DEVICE_CPU), ZeroOutOp);
 You should be able to compile `zero_out.cc` with a `C++` compiler such as `g++`
 or `clang` available on your system. The binary PIP package installs the header
 files and the library that you need to compile your Op in locations that are
-system specific. However, the TensorFlow python library provides functions
-`get_include` and `get_lib` to get the header and library directories
-respectively. Here is the output of those functions on a Ubuntu machine.
+system specific. However, the TensorFlow python library provides the
+`get_include` function to get the header directory.
+Here is the output of this function on a Ubuntu machine.
 
 ```bash
 $ python
 >>> import tensorflow as tf
 >>> tf.sysconfig.get_include()
 '/usr/local/lib/python2.7/site-packages/tensorflow/include'
->>> tf.sysconfig.get_lib()
-'/usr/local/lib/python2.7/site-packages/tensorflow/core'
->>>
 
 ```
 
@@ -134,13 +137,19 @@ Assuming you have `g++` installed, here is the sequence of commands you can use
 to compile your Op into a dynamic library.
 
 ```bash
-$ TF_INC=$(python -c 'import tensorflow as tf; print(tf.sysconfig.get_include())')
-$ TF_LIB=$(python -c 'import tensorflow as tf; print(tf.sysconfig.get_lib())')
+TF_INC=$(python -c 'import tensorflow as tf; print(tf.sysconfig.get_include())')
 
-$ g++ -std=c++11 -shared zero_out.cc -o zero_out.so \
--I $TF_INC -l tensorflow_framework -L $TF_LIB \
--fPIC -Wl,-rpath $TF_LIB
+g++ -std=c++11 -shared zero_out.cc -o zero_out.so -fPIC -I $TF_INC
 ```
+
+On Mac OS X, the additional flag "-undefined dynamic_lookup" is required when
+building the .so file.
+
+> Note on gcc version 5: gcc5 uses the new C++
+[ABI](https://gcc.gnu.org/gcc-5/changes.html#libstdcxx). The binary pip packages
+available on the TensorFlow website are built with gcc4 that uses the older ABI.
+If you compile your op library with gcc5, add `-D_GLIBCXX_USE_CXX11_ABI=0` to
+the command line to make the library compatible with the older abi.
 
 ### With TensorFlow source installation
 
@@ -149,21 +158,11 @@ system to compile your Op. Place a BUILD file with following Bazel build rule in
 the [`tensorflow/core/user_ops`][user_ops] directory.
 
 ```python
-cc_binary(
+load("//tensorflow:tensorflow.bzl", "tf_custom_op_library")
+
+tf_custom_op_library(
     name = "zero_out.so",
     srcs = ["zero_out.cc"],
-    linkopts = select({
-        "//conditions:default": [
-            "-Wl,-Bsymbolic",
-            "-lm",
-        ],
-        "//third_party/tensorflow:darwin": [],
-    }),
-    linkshared = 1,
-    linkstatic = 1,
-    deps = [
-        "//third_party/tensorflow/core:framework",
-    ],
 )
 ```
 
@@ -172,6 +171,12 @@ Run the following command to build `zero_out.so`.
 ```bash
 $ bazel build -c opt //tensorflow/core/user_ops:zero_out.so
 ```
+
+> Note:
+Although you can create a shared library (a `.so` file) with the standard
+`cc_library` rule, we strongly recommend that you use the `tf_custom_op_library`
+macro. It adds some required dependencies, and performs checks to ensure that
+the shared library is compatible with TensorFlow's plugin loading mechanism.
 
 ## Using the Op in Python
 
@@ -233,7 +238,7 @@ Then run your test:
 $ bazel test tensorflow/python:zero_out_op_test
 ```
 
-## Validation 
+## Validation
 
 The example above assumed that the Op applied to a tensor of any shape.  What
 if it only applied to vectors?  That means adding a check to the above OpKernel
@@ -475,8 +480,8 @@ REGISTER_OP("AttrDefaultExampleForAllTypes")
 Note in particular that the values of type `type` use [the `DT_*` names
 for the types](../../resources/dims_types.md#data-types).
 
-### Polymorphism 
-#### Type Polymorphism 
+### Polymorphism
+#### Type Polymorphism
 
 For ops that can take different types as input or produce different output
 types, you can specify [an attr](#attrs) in
@@ -496,7 +501,7 @@ REGISTER\_OP("ZeroOut")
 Your Op registration now specifies that the input's type must be `float`, or
 `int32`, and that its output will be the same type, since both have type `T`.
 
-> A note on naming:{#naming} Inputs, outputs, and attrs generally should be
+> <a id="naming"></a>A note on naming: Inputs, outputs, and attrs generally should be
 > given snake\_case names.  The one exception is attrs that are used as the type
 > of an input or in the type of an input. Those attrs can be inferred when the
 > op is added to the graph and so don't appear in the op's function.  For
@@ -704,7 +709,7 @@ TF_CALL_REAL_NUMBER_TYPES(REGISTER_KERNEL);
 #undef REGISTER_KERNEL
 ```
 
-#### List Inputs and Outputs 
+#### List Inputs and Outputs
 
 In addition to being able to accept or produce different types, ops can consume
 or produce a variable number of tensors.
@@ -810,7 +815,7 @@ expressions:
   ```c++
   REGISTER_OP("BuiltInTypesExample")
       .Input("integers: int32")
-      .Input("complex_numbers: scomplex64");
+      .Input("complex_numbers: complex64");
   ```
 
 * `<attr-type>`, where `<attr-type>` is the name of an [Attr](#attrs) with type
@@ -922,7 +927,7 @@ There are several ways to preserve backwards-compatibility.
 
 5. Namespace any new Ops you create, by prefixing the Op names with something
    unique to your project. This avoids having your Op colliding with any Ops
-   that might be included in future versions of Tensorflow.
+   that might be included in future versions of TensorFlow.
 
 6. Plan ahead! Try to anticipate future uses for the Op. Some signature changes
    can't be done in a compatible way (for example, making a list of the same
@@ -941,7 +946,7 @@ new optional arguments to the end.  Generally incompatible changes may only be
 made when TensorFlow's changes major versions, and must conform to the
 [`GraphDef` version semantics](../../resources/versions.md#graphs).
 
-## GPU Support 
+## GPU Support
 
 You can implement different OpKernels and register one for CPU and another for
 GPU, just like you can [register kernels for different types](#polymorphism).
@@ -969,6 +974,32 @@ kept on the CPU, add a `HostMemory()` call to the kernel registration, e.g.:
                           PadOp<GPUDevice, T>)
 ```
 
+### Compiling the kernel for the GPU device
+
+Look at
+[cuda_op_kernel.cu.cc](https://www.tensorflow.org/code/tensorflow/g3doc/how_tos/adding_an_op/cuda_op_kernel.cu.cc)
+for an example that uses a CUDA kernel to implement an op. The
+`tf_custom_op_library` accepts a `gpu_srcs` argument in which the list of source
+files containing the CUDA kernels (`*.cu.cc` files) can be specified. For use
+with a binary installation of TensorFlow, the CUDA kernels have to be compiled
+with NVIDIA's `nvcc` compiler. Here is the sequence of commands you can use to
+compile the
+[cuda_op_kernel.cu.cc](https://www.tensorflow.org/code/tensorflow/g3doc/how_tos/adding_an_op/cuda_op_kernel.cu.cc)
+and
+[cuda_op_kernel.cc](https://www.tensorflow.org/code/tensorflow/g3doc/how_tos/adding_an_op/cuda_op_kernel.cc)
+into a single dynamically loadable library:
+
+```bash
+nvcc -std=c++11 -c -o cuda_op_kernel.cu.o cuda_op_kernel.cu.cc \
+-I $TF_INC -D GOOGLE_CUDA=1 -x cu -Xcompiler -fPIC
+
+g++ -std=c++11 -shared -o cuda_op_kernel.so cuda_op_kernel.cc \
+cuda_op_kernel.cu.o -I $TF_INC -fPIC -lcudart
+```
+
+`cuda_op_kernel.so` produced above can be loaded as usual in Python, using the
+`tf.load_op_library` function.
+
 ## Implement the gradient in Python
 
 Given a graph of ops, TensorFlow uses automatic differentiation
@@ -980,13 +1011,13 @@ function which computes gradients with respect to the ops' inputs given
 gradients with respect to the ops' outputs.
 
 Mathematically, if an op computes \\(y = f(x)\\) the registered gradient op
-converts gradients \\(\partial / \partial y\\) with respect to \\(y\\) into
-gradients \\(\partial / \partial x\\) with respect to \\(x\\) via the chain
-rule:
+converts gradients \\(\partial L/ \partial y\\) of loss \\(L\\) with respect to
+\\(y\\) into gradients \\(\partial L/ \partial x\\) with respect to \\(x\\) via
+the chain rule:
 
-$$\frac{\partial}{\partial x}
-    = \frac{\partial}{\partial y} \frac{\partial y}{\partial x}
-    = \frac{\partial}{\partial y} \frac{\partial f}{\partial x}.$$
+$$\frac{\partial L}{\partial x}
+    = \frac{\partial L}{\partial y} \frac{\partial y}{\partial x}
+    = \frac{\partial L}{\partial y} \frac{\partial f}{\partial x}.$$
 
 In the case of `ZeroOut`, only one entry in the input affects the output, so the
 gradient with respect to the input is a sparse "one hot" tensor.  This is
@@ -1064,7 +1095,7 @@ to a shape function. For example, the
 the following:
 
 ```python
-@tf.RegisterShape("ZeroOut"):
+@tf.RegisterShape("ZeroOut")
 def _zero_out_shape(op):
   """Shape function for the ZeroOut op.
 
@@ -1079,7 +1110,7 @@ A shape function can also constrain the shape of an input. For the version of
 would be as follows:
 
 ```python
-@tf.RegisterShape("ZeroOut"):
+@tf.RegisterShape("ZeroOut")
 def _zero_out_shape(op):
   """Shape function for the ZeroOut op.
 

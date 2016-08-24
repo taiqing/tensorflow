@@ -82,7 +82,7 @@ See also `tuple` and `with_dependencies`.
 ##### Args:
 
 
-*  <b>`*inputs`</b>: One or more tensors to group.
+*  <b>`*inputs`</b>: Zero or more tensors to group.
 *  <b>`**kwargs`</b>: Optional parameters to pass when constructing the NodeDef.
 *  <b>`name`</b>: A name for this operation (optional).
 
@@ -93,8 +93,7 @@ See also `tuple` and `with_dependencies`.
 ##### Raises:
 
 
-*  <b>`ValueError`</b>: If an unknown keyword argument is provided, or if there are
-              no inputs.
+*  <b>`ValueError`</b>: If an unknown keyword argument is provided.
 
 
 - - -
@@ -148,17 +147,31 @@ Return either fn1() or fn2() based on the boolean predicate `pred`.
 `fn1` and `fn2` both return lists of output tensors. `fn1` and `fn2` must have
 the same non-zero number and type of outputs.
 
+Note that the conditional execution applies only to the operations defined in
+fn1 and fn2. Consider the following simple program:
+
+```python
+z = tf.mul(a, b)
+result = tf.cond(x < y, lambda: tf.add(x, z), lambda: tf.square(y))
+```
+
+If x < y, the tf.add operation will be executed and tf.square
+operation will not be executed. Since z is needed for at least one
+branch of the cond, the tf.mul operation is always executed, unconditionally.
+Although this behavior is consistent with the dataflow model of TensorFlow,
+it has occasionally surprised some users who expected a lazier semantics.
+
 ##### Args:
 
 
 *  <b>`pred`</b>: A scalar determining whether to return the result of `fn1` or `fn2`.
-*  <b>`fn1`</b>: The function to be performed if pred is true.
-*  <b>`fn2`</b>: The function to be performed if pref is false.
+*  <b>`fn1`</b>: The callable to be performed if pred is true.
+*  <b>`fn2`</b>: The callable to be performed if pref is false.
 *  <b>`name`</b>: Optional name prefix for the returned tensors.
 
 ##### Returns:
 
-  Tensors returned by the call to either `fn1` or `fn2`. If the functions
+  Tensors returned by the call to either `fn1` or `fn2`. If the callables
   return a singleton list, the element is extracted from the list.
 
 ##### Raises:
@@ -176,7 +189,7 @@ the same non-zero number and type of outputs.
   y = tf.constant(5)
   def f1(): return tf.mul(x, 17)
   def f2(): return tf.add(y, 23)
-  r = cond(math_ops.less(x, y), f1, f2)
+  r = cond(tf.less(x, y), f1, f2)
   # r is set to f1().
   # Operations in f2 (e.g., tf.add) are not executed.
 ```
@@ -190,10 +203,10 @@ Create a case operation.
 
 The `pred_fn_pairs` parameter is a dict or list of pairs of size N.
 Each pair contains a boolean scalar tensor and a python callable that
-creates the tensors to be returned if the boolean evaluates to True. `default`
-is a callable generating a list of tensors. All the callables in
-`pred_fn_pairs` as well as `default` should return the same number and types
-of tensors.
+creates the tensors to be returned if the boolean evaluates to True.
+`default` is a callable generating a list of tensors. All the callables
+in `pred_fn_pairs` as well as `default` should return the same number
+and types of tensors.
 
 If `exclusive==True`, all predicates are evaluated, and a logging operation
 with an error is returned if more than one of the predicates evaluates to
@@ -260,6 +273,82 @@ Example 2:
              callable.
 
 
+- - -
+
+### `tf.while_loop(cond, body, loop_vars, parallel_iterations=10, back_prop=True, swap_memory=False, name=None)` {#while_loop}
+
+Repeat `body` while the condition `cond` is true.
+
+`cond` is a callable returning a boolean scalar tensor. `body` is a callable
+returning a (possibly nested) tuple or list of tensors of the same
+arity (length and structure) and types as `loop_vars`. `loop_vars` is a
+(possibly nested) tuple or list of tensors that is passed to both `cond`
+and `body`. `cond` and `body` both take as many arguments as there are
+`loop_vars`.
+
+In addition to regular Tensors or IndexedSlices, the body may accept and
+return TensorArray objects.  The flows of the TensorArray objects will
+be appropriately forwarded between loops and during gradient calculations.
+
+While `cond` evaluates to true, `body` is executed.
+
+`while_loop` implements non-strict semantics, enabling multiple iterations
+to run in parallel. The maximum number of parallel iterations can be
+controlled by `parallel_iterations`, which gives users some control over
+memory consumption and execution order. For correct programs, `while_loop`
+should return the same result for any parallel_iterations > 0.
+
+For training, TensorFlow remembers the tensors that are produced in the
+forward inference but needed in back propagation. These tensors can be a
+main source of memory consumption and often cause OOM problems when training
+on GPUs.  When the flag swap_memory is true, we swap out these tensors from
+GPU to CPU.  This for example allows us to train RNN models with very long
+sequences and large batches.
+
+##### Args:
+
+
+*  <b>`cond`</b>: A callable that represents the termination condition of the loop.
+*  <b>`body`</b>: A callable that represents the loop body.
+*  <b>`loop_vars`</b>: A (possibly nested) tuple or list of numpy array, `Tensor`,
+    and `TensorArray` objects.
+*  <b>`parallel_iterations`</b>: The number of iterations allowed to run in parallel.
+*  <b>`back_prop`</b>: Whether backprop is enabled for this while loop.
+*  <b>`swap_memory`</b>: Whether GPU-CPU memory swap is enabled for this loop.
+*  <b>`name`</b>: Optional name prefix for the returned tensors.
+
+##### Returns:
+
+  The output tensors for the loop variables after the loop. When the length
+  of `loop_vars` is 1 this is a Tensor, TensorArray or IndexedSlice and when
+  the length of `loop_vars` is greater than 1 it returns a list.
+
+##### Raises:
+
+
+*  <b>`TypeError`</b>: if `cond` or `body` is not callable.
+*  <b>`ValueError`</b>: if `loop_vars` is empty.
+
+
+*  <b>`Example`</b>: 
+
+  ```python
+  i = tf.constant(0)
+  c = lambda i: tf.less(i, 10)
+  b = lambda i: tf.add(i, 1)
+  r = tf.while_loop(c, b, [i])
+  ```
+
+Example with nesting:
+
+  ```python
+  ijk_0 = (tf.constant(0), (tf.constant(1), tf.constant(2)))
+  c = lambda i, (j, k): i < 10
+  b = lambda i, (j, k): (i + 1, ((j + k), (j - k)))
+  ijk_final = tf.while_loop(c, b, ijk_0)
+  ```
+
+
 
 ## Logical Operators
 
@@ -271,6 +360,9 @@ to your graph.
 ### `tf.logical_and(x, y, name=None)` {#logical_and}
 
 Returns the truth value of x AND y element-wise.
+
+*NOTE*: `LogicalAnd` supports broadcasting. More about broadcasting
+[here](http://docs.scipy.org/doc/numpy/user/basics.broadcasting.html)
 
 ##### Args:
 
@@ -307,6 +399,9 @@ Returns the truth value of NOT x element-wise.
 
 Returns the truth value of x OR y element-wise.
 
+*NOTE*: `LogicalOr` supports broadcasting. More about broadcasting
+[here](http://docs.scipy.org/doc/numpy/user/basics.broadcasting.html)
+
 ##### Args:
 
 
@@ -338,10 +433,13 @@ operators to your graph.
 
 Returns the truth value of (x == y) element-wise.
 
+*NOTE*: `Equal` supports broadcasting. More about broadcasting
+[here](http://docs.scipy.org/doc/numpy/user/basics.broadcasting.html)
+
 ##### Args:
 
 
-*  <b>`x`</b>: A `Tensor`. Must be one of the following types: `float32`, `float64`, `uint8`, `int8`, `int16`, `int32`, `int64`, `complex64`, `quint8`, `qint8`, `qint32`, `string`.
+*  <b>`x`</b>: A `Tensor`. Must be one of the following types: `half`, `float32`, `float64`, `uint8`, `int8`, `int16`, `int32`, `int64`, `complex64`, `quint8`, `qint8`, `qint32`, `string`, `bool`, `complex128`.
 *  <b>`y`</b>: A `Tensor`. Must have the same type as `x`.
 *  <b>`name`</b>: A name for the operation (optional).
 
@@ -356,10 +454,13 @@ Returns the truth value of (x == y) element-wise.
 
 Returns the truth value of (x != y) element-wise.
 
+*NOTE*: `NotEqual` supports broadcasting. More about broadcasting
+[here](http://docs.scipy.org/doc/numpy/user/basics.broadcasting.html)
+
 ##### Args:
 
 
-*  <b>`x`</b>: A `Tensor`. Must be one of the following types: `float32`, `float64`, `uint8`, `int8`, `int16`, `int32`, `int64`, `complex64`, `quint8`, `qint8`, `qint32`, `string`.
+*  <b>`x`</b>: A `Tensor`. Must be one of the following types: `half`, `float32`, `float64`, `uint8`, `int8`, `int16`, `int32`, `int64`, `complex64`, `quint8`, `qint8`, `qint32`, `string`, `bool`, `complex128`.
 *  <b>`y`</b>: A `Tensor`. Must have the same type as `x`.
 *  <b>`name`</b>: A name for the operation (optional).
 
@@ -374,10 +475,13 @@ Returns the truth value of (x != y) element-wise.
 
 Returns the truth value of (x < y) element-wise.
 
+*NOTE*: `Less` supports broadcasting. More about broadcasting
+[here](http://docs.scipy.org/doc/numpy/user/basics.broadcasting.html)
+
 ##### Args:
 
 
-*  <b>`x`</b>: A `Tensor`. Must be one of the following types: `float32`, `float64`, `int32`, `int64`, `uint8`, `int16`, `int8`, `uint16`.
+*  <b>`x`</b>: A `Tensor`. Must be one of the following types: `float32`, `float64`, `int32`, `int64`, `uint8`, `int16`, `int8`, `uint16`, `half`.
 *  <b>`y`</b>: A `Tensor`. Must have the same type as `x`.
 *  <b>`name`</b>: A name for the operation (optional).
 
@@ -392,10 +496,13 @@ Returns the truth value of (x < y) element-wise.
 
 Returns the truth value of (x <= y) element-wise.
 
+*NOTE*: `LessEqual` supports broadcasting. More about broadcasting
+[here](http://docs.scipy.org/doc/numpy/user/basics.broadcasting.html)
+
 ##### Args:
 
 
-*  <b>`x`</b>: A `Tensor`. Must be one of the following types: `float32`, `float64`, `int32`, `int64`, `uint8`, `int16`, `int8`, `uint16`.
+*  <b>`x`</b>: A `Tensor`. Must be one of the following types: `float32`, `float64`, `int32`, `int64`, `uint8`, `int16`, `int8`, `uint16`, `half`.
 *  <b>`y`</b>: A `Tensor`. Must have the same type as `x`.
 *  <b>`name`</b>: A name for the operation (optional).
 
@@ -410,10 +517,13 @@ Returns the truth value of (x <= y) element-wise.
 
 Returns the truth value of (x > y) element-wise.
 
+*NOTE*: `Greater` supports broadcasting. More about broadcasting
+[here](http://docs.scipy.org/doc/numpy/user/basics.broadcasting.html)
+
 ##### Args:
 
 
-*  <b>`x`</b>: A `Tensor`. Must be one of the following types: `float32`, `float64`, `int32`, `int64`, `uint8`, `int16`, `int8`, `uint16`.
+*  <b>`x`</b>: A `Tensor`. Must be one of the following types: `float32`, `float64`, `int32`, `int64`, `uint8`, `int16`, `int8`, `uint16`, `half`.
 *  <b>`y`</b>: A `Tensor`. Must have the same type as `x`.
 *  <b>`name`</b>: A name for the operation (optional).
 
@@ -428,10 +538,13 @@ Returns the truth value of (x > y) element-wise.
 
 Returns the truth value of (x >= y) element-wise.
 
+*NOTE*: `GreaterEqual` supports broadcasting. More about broadcasting
+[here](http://docs.scipy.org/doc/numpy/user/basics.broadcasting.html)
+
 ##### Args:
 
 
-*  <b>`x`</b>: A `Tensor`. Must be one of the following types: `float32`, `float64`, `int32`, `int64`, `uint8`, `int16`, `int8`, `uint16`.
+*  <b>`x`</b>: A `Tensor`. Must be one of the following types: `float32`, `float64`, `int32`, `int64`, `uint8`, `int16`, `int8`, `uint16`, `half`.
 *  <b>`y`</b>: A `Tensor`. Must have the same type as `x`.
 *  <b>`name`</b>: A name for the operation (optional).
 
@@ -563,7 +676,7 @@ Returns which elements of x are finite.
 ##### Args:
 
 
-*  <b>`x`</b>: A `Tensor`. Must be one of the following types: `float32`, `float64`.
+*  <b>`x`</b>: A `Tensor`. Must be one of the following types: `half`, `float32`, `float64`.
 *  <b>`name`</b>: A name for the operation (optional).
 
 ##### Returns:
@@ -580,7 +693,7 @@ Returns which elements of x are Inf.
 ##### Args:
 
 
-*  <b>`x`</b>: A `Tensor`. Must be one of the following types: `float32`, `float64`.
+*  <b>`x`</b>: A `Tensor`. Must be one of the following types: `half`, `float32`, `float64`.
 *  <b>`name`</b>: A name for the operation (optional).
 
 ##### Returns:
@@ -597,7 +710,7 @@ Returns which elements of x are NaN.
 ##### Args:
 
 
-*  <b>`x`</b>: A `Tensor`. Must be one of the following types: `float32`, `float64`.
+*  <b>`x`</b>: A `Tensor`. Must be one of the following types: `half`, `float32`, `float64`.
 *  <b>`name`</b>: A name for the operation (optional).
 
 ##### Returns:
@@ -635,7 +748,7 @@ that are not a number (NaN) or infinity (Inf). Otherwise, passes `tensor` as-is.
 ##### Args:
 
 
-*  <b>`tensor`</b>: A `Tensor`. Must be one of the following types: `float32`, `float64`.
+*  <b>`tensor`</b>: A `Tensor`. Must be one of the following types: `half`, `float32`, `float64`.
 *  <b>`message`</b>: A `string`. Prefix of the error message.
 *  <b>`name`</b>: A name for the operation (optional).
 
@@ -650,10 +763,10 @@ that are not a number (NaN) or infinity (Inf). Otherwise, passes `tensor` as-is.
 
 Connect a `check_numerics` to every floating point tensor.
 
-`check_numerics` operations themselves are added for each `float` or `double`
-tensor in the graph. For all ops in the graph, the `check_numerics` op for
-all of its (`float` or `double`) inputs is guaranteed to run before the
-`check_numerics` op on any of its outputs.
+`check_numerics` operations themselves are added for each `half`, `float`,
+or `double` tensor in the graph. For all ops in the graph, the
+`check_numerics` op for all of its (`half`, `float`, or `double`) inputs
+is guaranteed to run before the `check_numerics` op on any of its outputs.
 
 ##### Returns:
 
@@ -669,6 +782,14 @@ Asserts that the given condition is true.
 If `condition` evaluates to false, print the list of tensors in `data`.
 `summarize` determines how many entries of the tensors to print.
 
+NOTE: To ensure that Assert executes, one usually attaches a dependency:
+
+```python
+ # Ensure maximum element of x is smaller or equal to 1
+assert_op = tf.Assert(tf.less_equal(tf.reduce_max(x), 1.), [x])
+x = tf.with_dependencies([assert_op], x)
+```
+
 ##### Args:
 
 
@@ -676,6 +797,12 @@ If `condition` evaluates to false, print the list of tensors in `data`.
 *  <b>`data`</b>: The tensors to print out when condition is false.
 *  <b>`summarize`</b>: Print this many entries of each tensor.
 *  <b>`name`</b>: A name for this operation (optional).
+
+##### Returns:
+
+
+*  <b>`assert_op`</b>: An `Operation` that, when executed, raises a
+  `tf.errors.InvalidArgumentError` if `condition` is not true.
 
 
 - - -

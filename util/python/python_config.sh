@@ -1,5 +1,5 @@
-#!/bin/bash
-# Copyright 2015 Google Inc. All Rights Reserved.
+#!/usr/bin/env bash
+# Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,11 +16,16 @@
 
 set -e -o errexit
 
-# Prefix expected paths with ./ locally and external/reponame/ for remote repos.
-# TODO(kchodorow): remove once runfiles paths are fixed, see
-# https://github.com/bazelbuild/bazel/issues/848.
-script_path=$(dirname $(dirname $(dirname "$0")))
-script_path=${script_path:-.}
+if [ -d "../org_tensorflow" ]; then
+  script_path="../org_tensorflow"
+else
+  # Prefix expected paths with ./ locally and external/reponame/ for remote repos.
+  # TODO(kchodorow): remove once runfiles paths are fixed, see
+  # https://github.com/bazelbuild/bazel/issues/848.
+  script_path=$(dirname $(dirname $(dirname "$0")))
+  script_path=${script_path:-.}
+fi
+
 EXPECTED_PATHS="$script_path/util/python/python_include"\
 " $script_path/util/python/python_lib"\
 " $script_path/third_party/py/numpy/numpy_include"
@@ -38,6 +43,47 @@ function main {
       exit 0
       ;;
   esac
+}
+
+function python_path {
+  python - <<END
+from __future__ import print_function
+import site
+import os
+
+try:
+  input = raw_input
+except NameError:
+  pass
+
+python_paths = []
+if os.getenv('PYTHONPATH') is not None:
+  python_paths = os.getenv('PYTHONPATH').split(':')
+
+all_paths = set(python_paths + site.getsitepackages())
+
+paths = []
+for path in all_paths:
+  if os.path.isdir(path):
+    paths.append(path)
+
+if len(paths) == 1:
+  print(paths[0])
+else:
+  ret_paths = " ".join(paths)
+  print(ret_paths)
+END
+}
+
+function default_python_path {
+  PYTHON_ARG="$1" python - <<END
+from __future__ import print_function
+import os
+
+default = os.getenv('PYTHON_ARG')
+default = str(default)
+print(default)
+END
 }
 
 function setup_python {
@@ -63,11 +109,27 @@ function setup_python {
     echo -e "\n\nERROR: Problem getting python include path.  Is distutils installed?"
     exit 1
   fi
-  local python_lib=$("${PYTHON_BIN_PATH}" -c 'from __future__ import print_function; from distutils import sysconfig; print(sysconfig.get_python_lib());')
-  if [ "$python_lib" == "" ]; then
-    echo -e "\n\nERROR: Problem getting python lib path.  Is distutils installed?"
-    exit 1
+
+  local python_lib_path=$(python_path)
+  echo "Found possible Python library paths:"
+  for x in $python_lib_path; do
+    echo "  $x"
+  done
+  set -- $python_lib_path
+  echo "Please input the desired Python library path to use.  Default is ["$1"]"
+  read b || true
+  if [ "$b" == "" ]; then
+   python_lib="$(default_python_path $python_lib_path)"
+   echo $python_lib
+  else
+    if test -d $b -a -x $b; then
+      python_lib=$b
+    else
+      echo -e "\n\nERROR: The path you have entered does not exist."
+      exit 1
+    fi
   fi
+
   local numpy_include=$("${PYTHON_BIN_PATH}" -c 'from __future__ import print_function; import numpy; print(numpy.get_include());')
   if [ "$numpy_include" == "" ]; then
     echo -e "\n\nERROR: Problem getting numpy include path.  Is numpy installed?"

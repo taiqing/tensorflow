@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -112,6 +112,9 @@ class Session {
   /// REQUIRES: The name of each Tensor of the input or output must
   /// match a "Tensor endpoint" in the `GraphDef` passed to `Create()`.
   ///
+  /// REQUIRES: At least one of `output_tensor_names` and
+  /// `target_node_names` must be non-empty.
+  ///
   /// REQUIRES: outputs is not nullptr if `output_tensor_names` is non-empty.
   virtual Status Run(const std::vector<std::pair<string, Tensor> >& inputs,
                      const std::vector<string>& output_tensor_names,
@@ -138,18 +141,19 @@ class Session {
   }
 
   /// \brief Like `Run`, but allows users to pass in a `RunOptions` proto and
-  /// to retrieve non-Tensor metadata output via a `RunOutputs` proto for this
-  /// step.
+  /// to retrieve non-Tensor metadata output via a `RunMetadata` proto for this
+  /// step.  `run_metadata` may be nullptr, in which case any metadata output is
+  /// discarded.
   /// NOTE: This API is still experimental and may change.
   virtual Status Run(const RunOptions& run_options,
                      const std::vector<std::pair<string, Tensor> >& inputs,
                      const std::vector<string>& output_tensor_names,
                      const std::vector<string>& target_node_names,
-                     std::vector<Tensor>* outputs, RunOutputs* run_outputs);
+                     std::vector<Tensor>* outputs, RunMetadata* run_metadata);
 
   /// \brief Sets up a graph for partial execution. All future feeds and
-  /// fetches are specified by 'input_names' and 'output_names'. Returns
-  /// 'handle' that can be used to perform a sequence of partial feeds and
+  /// fetches are specified by `input_names` and `output_names`. Returns
+  /// `handle` that can be used to perform a sequence of partial feeds and
   /// fetches.
   /// NOTE: This API is still experimental and may change.
   virtual Status PRunSetup(const std::vector<string>& input_names,
@@ -157,7 +161,7 @@ class Session {
                            const std::vector<string>& target_nodes,
                            string* handle);
 
-  /// \brief Continues the pending execution specified by 'handle' with the
+  /// \brief Continues the pending execution specified by `handle` with the
   /// provided input tensors and fills `outputs` for the endpoints specified
   /// in `output_names`.
   /// NOTE: This API is still experimental and may change.
@@ -187,6 +191,18 @@ Session* NewSession(const SessionOptions& options);
 /// `*out_session`, and this function will return `OK()`. Otherwise, this
 /// function will return an error status.
 Status NewSession(const SessionOptions& options, Session** out_session);
+
+/// \brief Resets resource containers associated with a target.
+///
+/// `containers` is a vector of string representation of resource container
+/// names. When a resource container is reset, the resources held by the
+/// container will be released. In particular, all Variables in the container
+/// will become undefined.
+///
+/// If Reset succeeds, this function will return `OK()`. Otherwise, this
+/// function will return an error status.
+Status Reset(const SessionOptions& options,
+             const std::vector<string>& containers);
 
 }  // end namespace tensorflow
 

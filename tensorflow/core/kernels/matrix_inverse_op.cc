@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,9 +14,8 @@ limitations under the License.
 ==============================================================================*/
 
 // See docs in ../ops/linalg_ops.cc.
-#include <cmath>
 
-#include "third_party/eigen3/Eigen/Cholesky"
+#include "third_party/eigen3/Eigen/Core"
 #include "third_party/eigen3/Eigen/LU"
 #include "tensorflow/core/framework/kernel_def_builder.h"
 #include "tensorflow/core/framework/op_kernel.h"
@@ -29,43 +28,36 @@ limitations under the License.
 
 namespace tensorflow {
 
-template <class Scalar, bool SupportsBatchOperationT>
-class MatrixInverseOp
-    : public UnaryLinearAlgebraOp<Scalar, SupportsBatchOperationT> {
+template <class Scalar, bool SupportsBatchOperation>
+class MatrixInverseOp : public LinearAlgebraOp<Scalar, SupportsBatchOperation> {
  public:
-  explicit MatrixInverseOp(OpKernelConstruction* context)
-      : UnaryLinearAlgebraOp<Scalar, SupportsBatchOperationT>(context) {}
-  ~MatrixInverseOp() override {}
+  typedef LinearAlgebraOp<Scalar, SupportsBatchOperation> Base;
 
-  TensorShape GetOutputMatrixShape(
-      const TensorShape& input_matrix_shape) override {
-    return input_matrix_shape;
+  explicit MatrixInverseOp(OpKernelConstruction* context) : Base(context) {
+    OP_REQUIRES_OK(context, context->GetAttr("adjoint", &adjoint_));
   }
 
-  int64 GetCostPerUnit(const TensorShape& input_matrix_shape) override {
-    const int64 rows = input_matrix_shape.dim_size(0);
-    if (rows > (1LL << 20)) {
-      // A big number to cap the cost in case overflow.
-      return kint64max;
-    } else {
-      return rows * rows * rows;
-    }
-  }
-
-  typedef UnaryLinearAlgebraOp<Scalar, SupportsBatchOperationT> Base;
   using Matrix = typename Base::Matrix;
-  using MatrixMap = typename Base::MatrixMap;
+  using MatrixMaps = typename Base::MatrixMaps;
   using ConstMatrixMap = typename Base::ConstMatrixMap;
+  using ConstMatrixMaps = typename Base::ConstMatrixMaps;
 
-  void ComputeMatrix(OpKernelContext* context, const ConstMatrixMap& input,
-                     MatrixMap* output) override {
-    OP_REQUIRES(context, input.rows() == input.cols(),
-                errors::InvalidArgument("Input matrix must be square."));
+  void ComputeMatrix(OpKernelContext* context, const ConstMatrixMaps& inputs,
+                     MatrixMaps* outputs) final {
+    const ConstMatrixMap& input = inputs[0];
     if (input.rows() == 0) {
       // By definition, an empty matrix's inverse is an empty matrix.
       return;
     }
-    Eigen::PartialPivLU<Matrix> lu_decomposition(input);
+    Eigen::PartialPivLU<Matrix> lu_decomposition;
+    if (adjoint_) {
+      // TODO(rmlarsen): For Eigen 3.2, this creates a temporary copy.
+      // Make sure to backport: https://bitbucket.org/eigen/eigen/commits/ \
+      // bd2219a74c96dfe3f6bc2c23588749e36d2d8173
+      lu_decomposition.compute(input.adjoint());
+    } else {
+      lu_decomposition.compute(input);
+    }
     // TODO(rmlarsen): Add check based on condition number estimation.
     // PartialPivLU cannot give strong guarantees on invertibility, but
     // we can at least guard against exact zero pivots. This can occur as
@@ -76,10 +68,12 @@ class MatrixInverseOp
         lu_decomposition.matrixLU().diagonal().cwiseAbs().minCoeff();
     OP_REQUIRES(context, min_abs_pivot > Scalar(0),
                 errors::InvalidArgument("Input is not invertible."));
-    output->noalias() = lu_decomposition.inverse();
+    outputs->at(0).noalias() = lu_decomposition.inverse();
   }
 
  private:
+  bool adjoint_;
+
   TF_DISALLOW_COPY_AND_ASSIGN(MatrixInverseOp);
 };
 

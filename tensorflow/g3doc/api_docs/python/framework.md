@@ -63,7 +63,7 @@ Returns a context manager that makes this `Graph` the default graph.
 This method should be used if you want to create multiple graphs
 in the same process. For convenience, a global default graph is
 provided, and all ops will be added to this graph if you do not
-create a new graph explicitly. Use this method the `with` keyword
+create a new graph explicitly. Use this method with the `with` keyword
 to specify that ops created within the scope of a block should be
 added to this graph.
 
@@ -238,12 +238,16 @@ string, a device function, or None:
 * If it is a device name string, all operations constructed in
   this context will be assigned to the device with that name, unless
   overridden by a nested `device()` context.
-* If it is a function, it will be treated as function from
+* If it is a function, it will be treated as a function from
   Operation objects to device name strings, and invoked each time
   a new Operation is created. The Operation will be assigned to
   the device with the returned name.
 * If it is None, all `device()` invocations from the enclosing context
   will be ignored.
+
+For information about the valid syntax of device name strings, see
+the documentation in
+[`DeviceNameUtils`](https://www.tensorflow.org/code/tensorflow/core/util/device_name_utils.h).
 
 For example:
 
@@ -267,6 +271,11 @@ with g.device(matmul_on_gpu):
   # will be placed on GPU 0; all other operations will be placed
   # on CPU 0.
 ```
+
+**N.B.** The device scope may be overridden by op wrappers or
+other library code. For example, a variable assignment op
+`v.assign()` must be colocated with the `tf.Variable` `v`, and
+incompatible device scopes will be ignored.
 
 ##### Args:
 
@@ -351,6 +360,12 @@ with g.name_scope('my_layer') as scope:
   output = tf.nn.relu(affine, name=scope)
 ```
 
+NOTE: This constructor validates the given `name`. Valid scope
+names match one of the following regular expressions:
+
+    [A-Za-z0-9.][A-Za-z0-9_.\\-/]* (for scopes at the root)
+    [A-Za-z0-9_.\\-/]* (for other scopes)
+
 ##### Args:
 
 
@@ -359,6 +374,11 @@ with g.name_scope('my_layer') as scope:
 ##### Returns:
 
   A context manager that installs `name` as a new name scope.
+
+##### Raises:
+
+
+*  <b>`ValueError`</b>: If `name` is not a valid scope name. The rules are the
 
 
 
@@ -389,9 +409,35 @@ a collection several times.
 
 - - -
 
+#### `tf.Graph.add_to_collections(names, value)` {#Graph.add_to_collections}
+
+Stores `value` in the collections given by `names`.
+
+Note that collections are not sets, so it is possible to add a value to
+a collection several times. This function makes sure that duplicates in
+`names` are ignored, but it will not check for pre-existing membership of
+`value` in any of the collections in `names`.
+
+`names` can be any iterable, but if `names` is a string, it is treated as a
+single collection name.
+
+##### Args:
+
+
+*  <b>`names`</b>: The keys for the collections to add to. The `GraphKeys` class
+    contains many standard names for collections.
+*  <b>`value`</b>: The value to add to the collections.
+
+
+- - -
+
 #### `tf.Graph.get_collection(name, scope=None)` {#Graph.get_collection}
 
 Returns a list of values in the collection with the given `name`.
+
+This is different from `get_collection_ref()` which always returns the
+actual collection list if it exists in that it returns a new list each time
+it is called.
 
 ##### Args:
 
@@ -399,7 +445,10 @@ Returns a list of values in the collection with the given `name`.
 *  <b>`name`</b>: The key for the collection. For example, the `GraphKeys` class
     contains many standard names for collections.
 *  <b>`scope`</b>: (Optional.) If supplied, the resulting list is filtered to include
-    only items whose name begins with this string.
+    only items whose `name` attribute matches using `re.match`. Items
+    without a `name` attribute are never returned if a scope is supplied and
+    the choice or `re.match` means that a `scope` without special tokens
+    filters by prefix.
 
 ##### Returns:
 
@@ -407,6 +456,31 @@ Returns a list of values in the collection with the given `name`.
   an empty list if no value has been added to that collection. The
   list contains the values in the order under which they were
   collected.
+
+
+- - -
+
+#### `tf.Graph.get_collection_ref(name)` {#Graph.get_collection_ref}
+
+Returns a list of values in the collection with the given `name`.
+
+If the collection exists, this returns the list itself, which can
+be modified in place to change the collection.  If the collection does
+not exist, it is created as an empty list and the list is returned.
+
+This is different from `get_collection()` which always returns a copy of
+the collection list if it exists and never creates an empty collection.
+
+##### Args:
+
+
+*  <b>`name`</b>: The key for the collection. For example, the `GraphKeys` class
+    contains many standard names for collections.
+
+##### Returns:
+
+  The list of values in the collection with the given `name`, or an empty
+  list if no value has been added to that collection.
 
 
 
@@ -518,7 +592,7 @@ This method may be called concurrently from multiple threads.
 
 #### `tf.Graph.seed` {#Graph.seed}
 
-
+The graph-level random seed of this graph.
 
 
 - - -
@@ -620,6 +694,7 @@ the default graph.
 
 
 *  <b>`TypeError`</b>: if any of the inputs is not a `Tensor`.
+*  <b>`ValueError`</b>: if colocation conflicts with existing device assignment.
 
 ##### Returns:
 
@@ -639,7 +714,7 @@ For example:
 
 ```python
 @tf.RegisterGradient("CustomSquare")
-def _custom_square_grad(op, inputs):
+def _custom_square_grad(op, grad):
   # ...
 
 with tf.Graph().as_default() as g:
@@ -672,21 +747,92 @@ with tf.Graph().as_default() as g:
 #### Other Methods
 - - -
 
-#### `tf.Graph.add_to_collections(names, value)` {#Graph.add_to_collections}
+#### `tf.Graph.colocate_with(op, ignore_existing=False)` {#Graph.colocate_with}
 
-Stores `value` in the collections given by `names`.
+Returns a context manager that specifies an op to colocate with.
 
-Note that collections are not sets, so it is possible to add a value to
-a collection several times. This function makes sure that duplicates in
-`names` are ignored, but it will not check for pre-existing membership of
-`value` in any of the collections in `names`.
+Note: this function is not for public use, only for internal libraries.
+
+For example:
+
+```python
+a = tf.Variable([1.0])
+with g.colocate_with(a):
+  b = tf.constant(1.0)
+  c = tf.add(a, b)
+```
+
+`b` and `c` will always be colocated with `a`, no matter where `a`
+is eventually placed.
 
 ##### Args:
 
 
-*  <b>`names`</b>: The keys for the collections to add to. The `GraphKeys` class
-    contains many standard names for collections.
-*  <b>`value`</b>: The value to add to the collections.
+*  <b>`op`</b>: The op to colocate all created ops with.
+*  <b>`ignore_existing`</b>: If true, only applies colocation of this op within
+    the context, rather than applying all colocation properties
+    on the stack.
+
+##### Raises:
+
+
+*  <b>`ValueError`</b>: if op is None.
+
+##### Yields:
+
+  A context manager that specifies the op with which to colocate
+  newly created ops.
+
+
+- - -
+
+#### `tf.Graph.container(container_name)` {#Graph.container}
+
+Returns a context manager that specifies the resource container to use.
+
+Stateful operations, such as variables and queues, can maintain their
+states on devices so that they can be shared by multiple processes.
+A resource container is a string name under which these stateful
+operations are tracked. These resources can be released or cleared
+with `tf.Session.reset()`.
+
+For example:
+
+```python
+with g.container('experiment0'):
+  # All stateful Operations constructed in this context will be placed
+  # in resource container "experiment0".
+  v1 = tf.Variable([1.0])
+  v2 = tf.Variable([2.0])
+  with g.container("experiment1"):
+    # All stateful Operations constructed in this context will be
+    # placed in resource container "experiment1".
+    v3 = tf.Variable([3.0])
+    q1 = tf.FIFOQueue(10, tf.float32)
+  # All stateful Operations constructed in this context will be
+  # be created in the "experiment0".
+  v4 = tf.Variable([4.0])
+  q1 = tf.FIFOQueue(20, tf.float32)
+  with g.container(""):
+    # All stateful Operations constructed in this context will be
+    # be placed in the default resource container.
+    v5 = tf.Variable([5.0])
+    q3 = tf.FIFOQueue(30, tf.float32)
+
+# Resets container "experiment0", after which the state of v1, v2, v4, q1
+# will become undefined (such as uninitialized).
+tf.Session.reset(target, ["experiment0"])
+```
+
+##### Args:
+
+
+*  <b>`container_name`</b>: container name string.
+
+##### Returns:
+
+  A context manager for defining resource containers for stateful ops,
+    yields the container name.
 
 
 - - -
@@ -694,6 +840,34 @@ a collection several times. This function makes sure that duplicates in
 #### `tf.Graph.get_all_collection_keys()` {#Graph.get_all_collection_keys}
 
 Returns a list of collections used in this graph.
+
+
+- - -
+
+#### `tf.Graph.is_feedable(tensor)` {#Graph.is_feedable}
+
+Returns `True` if and only if `tensor` is feedable.
+
+
+- - -
+
+#### `tf.Graph.is_fetchable(tensor_or_op)` {#Graph.is_fetchable}
+
+Returns `True` if and only if `tensor_or_op` is fetchable.
+
+
+- - -
+
+#### `tf.Graph.prevent_feeding(tensor)` {#Graph.prevent_feeding}
+
+Marks the given `tensor` as unfeedable in this graph.
+
+
+- - -
+
+#### `tf.Graph.prevent_fetching(op)` {#Graph.prevent_fetching}
+
+Marks the given `op` as unfetchable in this graph.
 
 
 
@@ -888,6 +1062,13 @@ regular expression:
 
 - - -
 
+#### `tf.Operation.colocation_groups()` {#Operation.colocation_groups}
+
+Returns the list of colocation groups of the op.
+
+
+- - -
+
 #### `tf.Operation.node_def` {#Operation.node_def}
 
 Returns a serialized `NodeDef` representation of this operation.
@@ -924,7 +1105,10 @@ DEPRECATED: Use outputs.
 
 ### `class tf.Tensor` {#Tensor}
 
-Represents a value produced by an `Operation`.
+Represents one of the outputs of an `Operation`.
+
+*Note:* the `Tensor` class will be replaced by `Output` in the future.
+Currently these two are aliases for each other.
 
 A `Tensor` is a symbolic handle to one of the outputs of an
 `Operation`. It does not hold the values of that operation's output,
@@ -1164,22 +1348,20 @@ Represents the type of the elements in a `Tensor`.
 
 The following `DType` objects are defined:
 
+* `tf.float16`: 16-bit half-precision floating-point.
 * `tf.float32`: 32-bit single-precision floating-point.
 * `tf.float64`: 64-bit double-precision floating-point.
 * `tf.bfloat16`: 16-bit truncated floating-point.
 * `tf.complex64`: 64-bit single-precision complex.
-
+* `tf.complex128`: 128-bit double-precision complex.
 * `tf.int8`: 8-bit signed integer.
 * `tf.uint8`: 8-bit unsigned integer.
 * `tf.uint16`: 16-bit unsigned integer.
 * `tf.int16`: 16-bit signed integer.
 * `tf.int32`: 32-bit signed integer.
 * `tf.int64`: 64-bit signed integer.
-
 * `tf.bool`: Boolean.
-
 * `tf.string`: String.
-
 * `tf.qint8`: Quantized 8-bit signed integer.
 * `tf.quint8`: Quantized 8-bit unsigned integer.
 * `tf.qint16`: Quantized 16-bit signed integer.
@@ -1416,23 +1598,61 @@ for more details.
 
 - - -
 
-### `tf.name_scope(name)` {#name_scope}
+### `tf.container(container_name)` {#container}
 
-Wrapper for `Graph.name_scope()` using the default graph.
-
-See
-[`Graph.name_scope()`](../../api_docs/python/framework.md#Graph.name_scope)
-for more details.
+Wrapper for `Graph.container()` using the default graph.
 
 ##### Args:
 
 
-*  <b>`name`</b>: A name for the scope.
+*  <b>`container_name`</b>: The container string to use in the context.
 
 ##### Returns:
 
-  A context manager that installs `name` as a new name scope in the
-  default graph.
+  A context manager that specifies the default container to use for newly
+  created stateful ops.
+
+
+- - -
+
+### `tf.name_scope(name, default_name=None, values=None)` {#name_scope}
+
+Returns a context manager for use when defining a Python op.
+
+This context manager validates that the given `values` are from the
+same graph, makes that graph the default graph, and pushes a
+name scope in that graph (see
+[`Graph.name_scope()`](../../api_docs/python/framework.md#Graph.name_scope)
+for more details on that).
+
+For example, to define a new Python op called `my_op`:
+
+```python
+def my_op(a, b, c, name=None):
+  with tf.name_scope(name, "MyOp", [a, b, c]) as scope:
+    a = tf.convert_to_tensor(a, name="a")
+    b = tf.convert_to_tensor(b, name="b")
+    c = tf.convert_to_tensor(c, name="c")
+    # Define some computation that uses `a`, `b`, and `c`.
+    return foo_op(..., name=scope)
+```
+
+##### Args:
+
+
+*  <b>`name`</b>: The name argument that is passed to the op function.
+*  <b>`default_name`</b>: The default name to use if the `name` argument is `None`.
+*  <b>`values`</b>: The list of `Tensor` arguments that are passed to the op function.
+
+##### Returns:
+
+  A context manager for use in defining Python ops. Yields the name scope.
+
+##### Raises:
+
+
+*  <b>`ValueError`</b>: if neither `name` nor `default_name` is provided
+    but `values` are.
 
 
 - - -
@@ -1470,7 +1690,6 @@ and Python scalars. For example:
 
 ```python
 import numpy as np
-array = np.random.rand(32, 100, 100)
 
 def my_func(arg):
   arg = tf.convert_to_tensor(arg, dtype=tf.float32)
@@ -1495,7 +1714,8 @@ and scalars in addition to `Tensor` objects.
 *  <b>`dtype`</b>: Optional element type for the returned tensor. If missing, the
     type is inferred from the type of `value`.
 *  <b>`name`</b>: Optional name to use if a new `Tensor` is created.
-*  <b>`as_ref`</b>: True if we want the result as a ref tensor.
+*  <b>`as_ref`</b>: True if we want the result as a ref tensor. Only used if a new
+    `Tensor` is created.
 
 ##### Returns:
 
@@ -1514,15 +1734,15 @@ and scalars in addition to `Tensor` objects.
 
 Converts the given object to a `Tensor` or an `IndexedSlices`.
 
-If `value` is an `IndexedSlices` it is returned
+If `value` is an `IndexedSlices` or `SparseTensor` it is returned
 unmodified. Otherwise, it is converted to a `Tensor` using
 `convert_to_tensor()`.
 
 ##### Args:
 
 
-*  <b>`value`</b>: An `IndexedSlices` or an object that can be consumed by
-    `convert_to_tensor()`.
+*  <b>`value`</b>: An `IndexedSlices`, `SparseTensor`, or an object that can be consumed
+    by `convert_to_tensor()`.
 *  <b>`dtype`</b>: (Optional.) The required `DType` of the returned `Tensor` or
     `IndexedSlices`.
 *  <b>`name`</b>: (Optional.) A name to use if a new `Tensor` is created.
@@ -1530,7 +1750,7 @@ unmodified. Otherwise, it is converted to a `Tensor` using
 
 ##### Returns:
 
-  An `Tensor` or an `IndexedSlices` based on `value`.
+  An `Tensor`, `IndexedSlices`, or `SparseTensor` based on `value`.
 
 ##### Raises:
 
@@ -1573,7 +1793,7 @@ after calling this function will result in undefined behavior.
 
 - - -
 
-### `tf.import_graph_def(graph_def, input_map=None, return_elements=None, name=None, op_dict=None)` {#import_graph_def}
+### `tf.import_graph_def(graph_def, input_map=None, return_elements=None, name=None, op_dict=None, producer_op_list=None)` {#import_graph_def}
 
 Imports the TensorFlow graph in `graph_def` into the Python `Graph`.
 
@@ -1600,6 +1820,12 @@ protocol buffer, and extract individual objects in the `GraphDef` as
 *  <b>`op_dict`</b>: (Optional.) A dictionary mapping op type names to `OpDef` protos.
     Must contain an `OpDef` proto for each op type named in `graph_def`.
     If omitted, uses the `OpDef` protos registered in the global registry.
+*  <b>`producer_op_list`</b>: (Optional.) An `OpList` proto with the (possibly stripped)
+    list of `OpDef`s used by the producer of the graph. If provided, attrs
+    for ops in `graph_def` that are not in `op_dict` that have their default
+    value according to `producer_op_list` will be removed. This will allow
+    some more `GraphDef`s produced by later binaries to be accepted by
+    earlier binaries.
 
 ##### Returns:
 
@@ -1619,15 +1845,43 @@ protocol buffer, and extract individual objects in the `GraphDef` as
 
 - - -
 
+### `tf.load_file_system_library(library_filename)` {#load_file_system_library}
+
+Loads a TensorFlow plugin, containing file system implementation.
+
+Pass `library_filename` to a platform-specific mechanism for dynamically
+loading a library. The rules for determining the exact location of the
+library are platform-specific and are not documented here.
+
+##### Args:
+
+
+*  <b>`library_filename`</b>: Path to the plugin.
+    Relative or absolute filesystem path to a dynamic library file.
+
+##### Returns:
+
+  None.
+
+##### Raises:
+
+
+*  <b>`RuntimeError`</b>: when unable to load the library.
+
+
+- - -
+
 ### `tf.load_op_library(library_filename)` {#load_op_library}
 
 Loads a TensorFlow plugin, containing custom ops and kernels.
 
 Pass "library_filename" to a platform-specific mechanism for dynamically
 loading a library. The rules for determining the exact location of the
-library are platform-specific and are not documented here.
-Expects the symbols "RegisterOps", "RegisterKernels", and "GetOpList", to be
-defined in the library.
+library are platform-specific and are not documented here. When the
+library is loaded, ops and kernels registered in the library via the
+REGISTER_* macros are made available in the TensorFlow process. Note
+that ops with the same name as an existing op are rejected and not
+registered with the process.
 
 ##### Args:
 
@@ -1681,7 +1935,10 @@ for more details.
 *  <b>`key`</b>: The key for the collection. For example, the `GraphKeys` class
     contains many standard names for collections.
 *  <b>`scope`</b>: (Optional.) If supplied, the resulting list is filtered to include
-    only items whose name begins with this string.
+    only items whose `name` attribute matches using `re.match`. Items
+    without a `name` attribute are never returned if a scope is supplied and
+    the choice or `re.match` means that a `scope` without special tokens
+    filters by prefix.
 
 ##### Returns:
 
@@ -1689,6 +1946,29 @@ for more details.
   an empty list if no value has been added to that collection. The
   list contains the values in the order under which they were
   collected.
+
+
+- - -
+
+### `tf.get_collection_ref(key)` {#get_collection_ref}
+
+Wrapper for `Graph.get_collection_ref()` using the default graph.
+
+See [`Graph.get_collection_ref()`](../../api_docs/python/framework.md#Graph.get_collection_ref)
+for more details.
+
+##### Args:
+
+
+*  <b>`key`</b>: The key for the collection. For example, the `GraphKeys` class
+    contains many standard names for collections.
+
+##### Returns:
+
+  The list of values in the collection with the given `name`, or an empty
+  list if no value has been added to that collection.  Note that this returns
+  the collection list itself, which can be modified in place to change the
+  collection.
 
 
 - - -
@@ -1923,11 +2203,17 @@ Returns a list of Dimensions, or None if the shape is unspecified.
 
 #### `tf.TensorShape.as_list()` {#TensorShape.as_list}
 
-Returns a list of integers or None for each dimension.
+Returns a list of integers or `None` for each dimension.
 
 ##### Returns:
 
-  A list of integers or None for each dimension.
+  `None` if shape is unknown; otherwise, a list of integers or `None` for
+  each dimension.
+
+##### Raises:
+
+
+*  <b>`ValueError`</b>: if `self` is completely unknown.
 
 
 - - -
@@ -2141,6 +2427,11 @@ Creates a new TensorShape with the given dimensions.
 *  <b>`dims`</b>: A list of Dimensions, or None if the shape is unspecified.
 *  <b>`DEPRECATED`</b>: A single integer is treated as a singleton list.
 
+##### Raises:
+
+
+*  <b>`TypeError`</b>: If dims cannot be converted to a list of dimensions.
+
 
 - - -
 
@@ -2242,39 +2533,7 @@ The value of this dimension, or None if it is unknown.
 
 ### `tf.op_scope(values, name, default_name=None)` {#op_scope}
 
-Returns a context manager for use when defining a Python op.
-
-This context manager validates that the given `values` are from the
-same graph, ensures that that graph is the default graph, and pushes a
-name scope.
-
-For example, to define a new Python op called `my_op`:
-
-```python
-def my_op(a, b, c, name=None):
-  with tf.op_scope([a, b, c], name, "MyOp") as scope:
-    a = tf.convert_to_tensor(a, name="a")
-    b = tf.convert_to_tensor(b, name="b")
-    c = tf.convert_to_tensor(c, name="c")
-    # Define some computation that uses `a`, `b`, and `c`.
-    return foo_op(..., name=scope)
-```
-
-##### Args:
-
-
-*  <b>`values`</b>: The list of `Tensor` arguments that are passed to the op function.
-*  <b>`name`</b>: The name argument that is passed to the op function.
-*  <b>`default_name`</b>: The default name to use if the `name` argument is `None`.
-
-##### Returns:
-
-  A context manager for use in defining Python ops. Yields the name scope.
-
-##### Raises:
-
-
-*  <b>`ValueError`</b>: if neither `name` nor `default_name` is provided.
+DEPRECATED. Same as name_scope above, just different argument order.
 
 
 - - -
@@ -2320,6 +2579,10 @@ It must return a `Tensor` with the given `dtype` if specified. If the
 conversion function creates a new `Tensor`, it should use the given
 `name` if specified. All exceptions will be propagated to the caller.
 
+The conversion function may return `NotImplemented` for some
+inputs. In this case, the conversion process will continue to try
+subsequent conversion functions.
+
 If `as_ref` is true, the function must return a `Tensor` reference,
 such as a `Variable`.
 
@@ -2348,6 +2611,158 @@ registered with a smaller priority than `G`.
 
 
 ## Other Functions and Classes
+- - -
+
+### `class tf.DeviceSpec` {#DeviceSpec}
+
+Represents a (possibly partial) specification for a TensorFlow device.
+
+`DeviceSpec`s are used throughout TensorFlow to describe where state is stored
+and computations occur. Using `DeviceSpec` allows you to parse device spec
+strings to verify their validity, merge them or compose them programmatically.
+
+Example:
+
+```python
+# Place the operations on device "GPU:0" in the "ps" job.
+device_spec = DeviceSpec(job="ps", device_type="GPU", device_index=0)
+with tf.device(device_spec):
+  # Both my_var and squared_var will be placed on /job:ps/device:GPU:0.
+  my_var = tf.Variable(..., name="my_variable")
+  squared_var = tf.square(my_var)
+```
+
+If a `DeviceSpec` is partially specified, it will be merged with other
+`DeviceSpec`s according to the scope in which it is defined. `DeviceSpec`
+components defined in inner scopes take precedence over those defined in
+outer scopes.
+
+```python
+with tf.device(DeviceSpec(job="train", )):
+  with tf.device(DeviceSpec(job="ps", device_type="GPU", device_index=0):
+    # Nodes created here will be assigned to /job:ps/device:GPU:0.
+  with tf.device(DeviceSpec(device_type="GPU", device_index=1):
+    # Nodes created here will be assigned to /job:train/device:GPU:1.
+```
+
+A `DeviceSpec` consists of 5 components -- each of
+which is optionally specified:
+
+* Job: The job name.
+* Replica: The replica index.
+* Task: The task index.
+* Device type: The device type string (e.g. "CPU" or "GPU").
+* Device index: The device index.
+- - -
+
+#### `tf.DeviceSpec.__init__(job=None, replica=None, task=None, device_type=None, device_index=None)` {#DeviceSpec.__init__}
+
+Create a new `DeviceSpec` object.
+
+##### Args:
+
+
+*  <b>`job`</b>: string.  Optional job name.
+*  <b>`replica`</b>: int.  Optional replica index.
+*  <b>`task`</b>: int.  Optional task index.
+*  <b>`device_type`</b>: Optional device type string (e.g. "CPU" or "GPU")
+*  <b>`device_index`</b>: int.  Optional device index.  If left
+    unspecified, device represents 'any' device_index.
+
+
+- - -
+
+#### `tf.DeviceSpec.from_string(spec)` {#DeviceSpec.from_string}
+
+Construct a `DeviceSpec` from a string.
+
+##### Args:
+
+
+*  <b>`spec`</b>: a string of the form
+   /job:<name>/replica:<id>/task:<id>/device:CPU:<id>
+  or
+   /job:<name>/replica:<id>/task:<id>/device:GPU:<id>
+  as cpu and gpu are mutually exclusive.
+  All entries are optional.
+
+##### Returns:
+
+  A DeviceSpec.
+
+
+- - -
+
+#### `tf.DeviceSpec.job` {#DeviceSpec.job}
+
+
+
+
+- - -
+
+#### `tf.DeviceSpec.merge_from(dev)` {#DeviceSpec.merge_from}
+
+Merge the properties of "dev" into this `DeviceSpec`.
+
+##### Args:
+
+
+*  <b>`dev`</b>: a `DeviceSpec`.
+
+
+- - -
+
+#### `tf.DeviceSpec.parse_from_string(spec)` {#DeviceSpec.parse_from_string}
+
+Parse a `DeviceSpec` name into its components.
+
+##### Args:
+
+
+*  <b>`spec`</b>: a string of the form
+   /job:<name>/replica:<id>/task:<id>/device:CPU:<id>
+  or
+   /job:<name>/replica:<id>/task:<id>/device:GPU:<id>
+  as cpu and gpu are mutually exclusive.
+  All entries are optional.
+
+##### Returns:
+
+  The `DeviceSpec`.
+
+##### Raises:
+
+
+*  <b>`ValueError`</b>: if the spec was not valid.
+
+
+- - -
+
+#### `tf.DeviceSpec.replica` {#DeviceSpec.replica}
+
+
+
+
+- - -
+
+#### `tf.DeviceSpec.task` {#DeviceSpec.task}
+
+
+
+
+- - -
+
+#### `tf.DeviceSpec.to_string()` {#DeviceSpec.to_string}
+
+Return a string representation of this `DeviceSpec`.
+
+##### Returns:
+
+  a string of the form
+  /job:<name>/replica:<id>/task:<id>/device:<device_type>:<id>.
+
+
+
 - - -
 
 ### `class tf.bytes` {#bytes}

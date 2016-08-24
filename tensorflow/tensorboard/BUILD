@@ -10,11 +10,12 @@ exports_files(["LICENSE"])
 filegroup(
     name = "frontend",
     srcs = [
+        "TAG",
         "dist/index.html",
         "dist/tf-tensorboard.html",
-        "//tensorflow/tensorboard/bower:bower",
-        "TAG",
-    ] + glob(["lib/**/*"]),
+        "//tensorflow/tensorboard/bower",
+        "//tensorflow/tensorboard/lib:all_files",
+    ],
 )
 
 py_binary(

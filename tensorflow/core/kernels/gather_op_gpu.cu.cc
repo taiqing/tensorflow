@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -36,11 +36,13 @@ __global__ void GatherOpKernel(const T* params, const Index* indices, T* out,
     Index indices_slice_i = i - indices_i * slice_size;
     Index params_first_index = ldg(indices + indices_i);
     if (!(params_first_index >= 0 && params_first_index < first_dim_size)) {
-      // Ignore indices that are out of range.
-      continue;
+      // Set indices out of range to zero
+      // TODO(fpmc): Log an error for transfer back to host.
+      out[i] = T(0);
+    } else {
+      Index params_i = params_first_index * slice_size + indices_slice_i;
+      out[i] = ldg(params + params_i);
     }
-    Index params_i = params_first_index * slice_size + indices_slice_i;
-    out[i] = ldg(params + params_i);
   }
 }
 
@@ -50,9 +52,16 @@ struct Gather<GPUDevice, T, Index> {
   Index operator()(const GPUDevice& d, typename TTypes<T>::ConstMatrix Tparams,
                    typename TTypes<Index>::ConstFlat Tindices,
                    typename TTypes<T>::Matrix Tout) {
+    const int64 out_size = Tout.size();
+    if (out_size == 0) {
+      // We need a check here since the CPU version does useful error checking
+      // work if there are nonempty indices but empty slices, so the kernel is
+      // executed in that case.  In the GPU case we don't know how to do error
+      // checking, so we skip the loop entirely.
+      return -1;
+    }
     const int64 first_dim_size = Tparams.dimension(0);
     const int64 indices_size = Tindices.size();
-    const int64 out_size = Tout.size();
     CudaLaunchConfig config = GetCudaLaunchConfig(out_size, d);
     // clang-format off
     GatherOpKernel<T, Index>

@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,6 +27,20 @@ limitations under the License.
 namespace tensorflow {
 
 typedef Eigen::GpuDevice GPUDevice;
+
+// There are no native fp16 atomics (we simulate them using 32-bit atomics),
+// so fp16 sums are done in fp32 internally. (We don't have a lot of shared
+// memory traffic; BiasGradNCHW_SharedAtomics in particular works almost
+// entirely on a local variable.)
+template <class T>
+struct AccumulatorType {
+  typedef T type;
+};
+
+template <>
+struct AccumulatorType<Eigen::half> {
+  typedef float type;
+};
 
 // Definition of the GPU implementations declared in bias_op.cc.
 
@@ -58,6 +72,9 @@ void BiasGPU<T>::compute(const GPUDevice& d, const T* input, const T* bias,
   const int32 bias_size = channel;
   const int32 image_size = height * width;
   const int32 total_count = batch * bias_size * image_size;
+  if (total_count == 0) {
+    return;
+  }
   CudaLaunchConfig config = GetCudaLaunchConfig(total_count, d);
   if (data_format == FORMAT_NHWC) {
     BiasNHWCKernel<
@@ -99,50 +116,72 @@ template <typename T>
 __global__ void BiasGradNHWC_SharedAtomics(int32 nthreads,
                                            const T* output_backprop,
                                            T* bias_backprop, int32 bias_size) {
-  T* s_data = reinterpret_cast<T*>(s_buf);
+  typedef typename AccumulatorType<T>::type AccT;
+  AccT* s_data = reinterpret_cast<AccT*>(s_buf);
   for (int32 index = threadIdx.x; index < bias_size; index += blockDim.x) {
-    s_data[index] = 0;
+    s_data[index] = AccT(0);
   }
   __syncthreads();
 
   for (int32 index = blockIdx.x * blockDim.x + threadIdx.x; index < nthreads;
        index += blockDim.x * gridDim.x) {
     int32 bias_offset = index % bias_size;
-    CudaAtomicAdd(s_data + bias_offset, ldg(output_backprop + index));
+    CudaAtomicAdd(s_data + bias_offset, AccT(ldg(output_backprop + index)));
   }
   __syncthreads();
 
   for (int32 index = threadIdx.x; index < bias_size; index += blockDim.x) {
-    CudaAtomicAdd(bias_backprop + index, s_data[index]);
+    CudaAtomicAdd(bias_backprop + index, T(s_data[index]));
   }
 }
 
 template <typename T>
-__global__ void BiasGradNCHW_SharedAtomics(int32 nthreads,
-                                           const T* output_backprop,
-                                           T* bias_backprop, int32 bias_size,
-                                           int32 image_size,
-                                           int32 shared_replicas) {
-  T* s_data = reinterpret_cast<T*>(s_buf);
-  int32 s_data_size = bias_size * shared_replicas;
+__global__ void BiasGradNCHW_SharedAtomics(const T* output_backprop,
+                                           T* bias_backprop, int32 batch,
+                                           int32 bias_size, int32 image_size,
+                                           int group_size) {
+  // Initialize the shared memory.
+  typedef typename AccumulatorType<T>::type AccT;
+  __shared__ AccT s_data[32];
+  int32 s_data_size = sizeof(s_data) / sizeof(T);
   for (int32 index = threadIdx.x; index < s_data_size; index += blockDim.x) {
-    s_data[index] = 0;
+    s_data[index] = AccT(0);
   }
   __syncthreads();
 
-  for (int32 index = blockIdx.x * blockDim.x + threadIdx.x; index < nthreads;
-       index += blockDim.x * gridDim.x) {
-    int32 index2 = index / image_size;
-    int32 bias_slot_index = index2 % bias_size;
-    int32 bias_slot_offset = index % shared_replicas;
-    int32 bias_offset = bias_slot_index * shared_replicas + bias_slot_offset;
-    CudaAtomicAdd(s_data + bias_offset, ldg(output_backprop + index));
+  // Accumulate all the values within this thread. They all have the same bias
+  // index.
+  int32 bias_index = blockIdx.x % bias_size;
+  int32 group_index = blockIdx.x / bias_size;
+  int32 total_count = batch * image_size;
+  AccT sum(0);
+  for (int32 index = group_index * blockDim.x + threadIdx.x;
+       index < total_count; index += blockDim.x * group_size) {
+    int32 image_offset = index % image_size;
+    int32 batch = index / image_size;
+    T val = ldg(output_backprop +
+                (batch * bias_size + bias_index) * image_size + image_offset);
+    sum += AccT(val);
   }
+
+  // Write the accumulated sum in this thread to the shared memory. Each thread
+  // shifts their write location to avoid bank conflict.
+  int bias_offset = threadIdx.x % 32;
+  CudaAtomicAdd(s_data + bias_offset, sum);
   __syncthreads();
 
-  for (int32 index = threadIdx.x; index < s_data_size; index += blockDim.x) {
-    int bias_slot_index = index / shared_replicas;
-    CudaAtomicAdd(bias_backprop + bias_slot_index, s_data[index]);
+  // Accumulate the results in the shared memory into the first element.
+  // No syncthreads is needed since this is only in the same warp.
+  int32 thread_index = threadIdx.x;
+  if (thread_index < 16) s_data[thread_index] += s_data[thread_index + 16];
+  if (thread_index < 8) s_data[thread_index] += s_data[thread_index + 8];
+  if (thread_index < 4) s_data[thread_index] += s_data[thread_index + 4];
+  if (thread_index < 2) s_data[thread_index] += s_data[thread_index + 2];
+  if (thread_index < 1) s_data[thread_index] += s_data[thread_index + 1];
+
+  // The first thread writes out the accumulated result to the global location.
+  if (thread_index == 0) {
+    CudaAtomicAdd(bias_backprop + bias_index, T(s_data[0]));
   }
 }
 
@@ -154,24 +193,16 @@ void BiasGradGPU<T>::compute(const GPUDevice& d, const T* output_backprop,
   const int32 bias_size = channel;
   const int32 image_size = height * width;
   const int32 total_count = batch * bias_size * image_size;
+  if (total_count == 0) {
+    return;
+  }
+  static constexpr int32 kWarpSize = 32;
   CudaLaunchConfig config = GetCudaLaunchConfig(total_count, d);
 
   const int max_shared_memory_size = d.sharedMemPerBlock() / 2;
-  int32 shared_memory_size = bias_size * sizeof(T);
-  int shared_replicas = 1;
-  if (data_format == FORMAT_NCHW) {
-    // For NCHW, the reduction in the HW dimensions all go to the same locaiton,
-    // which causes a lot of bank conflicts. So having a number of them can
-    // improve the performance. But we also want to limit their usage so the
-    // warp occupancy does not decrease.
-    if (shared_memory_size <= max_shared_memory_size) {
-      // We need enough shared memory to avoid bank conflict. But not too much
-      // so that it would reduce occupancy.
-      static constexpr int kMaxSharedReplicas = 8;
-      shared_replicas = std::min(kMaxSharedReplicas,
-                                 max_shared_memory_size / shared_memory_size);
-      shared_memory_size *= shared_replicas;
-    }
+  int32 shared_memory_size = 0;
+  if (data_format == FORMAT_NHWC) {
+    shared_memory_size = bias_size * sizeof(typename AccumulatorType<T>::type);
   }
   // Check if we have enough shared memory.
   if (shared_memory_size <= max_shared_memory_size) {
@@ -181,10 +212,16 @@ void BiasGradGPU<T>::compute(const GPUDevice& d, const T* output_backprop,
                d.stream()>>>(total_count, output_backprop, bias_backprop,
                              bias_size);
     } else {
+      // Round up the block count to multiple of bias_size.
+      int group_size = (config.block_count + bias_size - 1) / bias_size;
+      config.block_count = group_size * bias_size;
+      if (config.thread_per_block < kWarpSize) {
+        config.thread_per_block = kWarpSize;
+      }
       BiasGradNCHW_SharedAtomics<
-          T><<<config.block_count, config.thread_per_block, shared_memory_size,
-               d.stream()>>>(total_count, output_backprop, bias_backprop,
-                             bias_size, image_size, shared_replicas);
+          T><<<config.block_count, config.thread_per_block, 0, d.stream()>>>(
+          output_backprop, bias_backprop, batch, bias_size, image_size,
+          group_size);
     }
   } else {
     // Note that even if we don't have enough shared memory to fit the entire

@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,6 +30,8 @@ limitations under the License.
 #include "tensorflow/core/framework/node_def_util.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/rendezvous.h"
+#include "tensorflow/core/framework/selective_registration.h"
+#include "tensorflow/core/framework/session_state.h"
 #include "tensorflow/core/framework/step_stats.pb.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/tensor_shape.h"
@@ -40,6 +42,7 @@ limitations under the License.
 #include "tensorflow/core/framework/unique_tensor_references.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/lib/gtl/manual_constructor.h"
 #include "tensorflow/core/platform/env.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/macros.h"
@@ -72,7 +75,9 @@ class OpKernel {
   virtual ~OpKernel();
 
   // An OpKernel's computation can be either synchronous or
-  // asynchronous.
+  // asynchronous. All OpKernel Compute() methods must be thread-safe as they
+  // may be called concurrently (e.g. by multiple executions of the same graph
+  // concurrently).
   //
   // Most OpKernels should compute synchronously.  They should
   // subclass OpKernel and override the Compute() method and have it
@@ -99,7 +104,7 @@ class OpKernel {
   // Returns true iff this op kernel is considered "expensive". The
   // runtime may use this flag to optimize graph execution for example
   // to "inline" inexpensive kernels.
-  virtual bool IsExpensive() { return true; }
+  virtual bool IsExpensive() { return expensive_; }
 
   // Accessors.
   const NodeDef& def() const { return def_; }
@@ -121,8 +126,8 @@ class OpKernel {
     return output_memory_types_;
   }
 
-  Status InputRange(const string& input_name, int* start, int* stop) const;
-  Status OutputRange(const string& output_name, int* start, int* stop) const;
+  Status InputRange(StringPiece input_name, int* start, int* stop) const;
+  Status OutputRange(StringPiece output_name, int* start, int* stop) const;
 
   // We allow legacy scalars within Google up until GraphDef version 6.
   // TODO(irving): Remove when we can drop support for GraphDef version 5.
@@ -155,6 +160,7 @@ class OpKernel {
   const bool is_internal_;  // True if this is an internal operation
   NameRangeMap input_name_map_;
   NameRangeMap output_name_map_;
+  bool expensive_;
 
   TF_DISALLOW_COPY_AND_ASSIGN(OpKernel);
 };
@@ -174,6 +180,8 @@ class AsyncOpKernel : public OpKernel {
   AsyncOpKernel* AsAsync() final { return this; }
 
   void Compute(OpKernelContext* context) final;
+
+  bool IsExpensive() override { return true; }
 };
 
 // Wraps a tensor that is held by an Op across calls to Compute(). For
@@ -194,7 +202,9 @@ class PersistentTensor {
 
   // The check for initialization does not need to access the
   // underlying tensor buffer.
-  bool IsInitialized() { return tensor_.IsInitialized(); }
+  bool IsInitialized() const { return tensor_.IsInitialized(); }
+
+  int64 NumElements() const { return tensor_.NumElements(); }
 
  private:
   Tensor tensor_;
@@ -294,7 +304,7 @@ class OpKernelConstruction {
   // attr with attr_name is found in def(), or the attr does not have
   // a matching type, a non-ok status will be returned.
   template <class T>
-  Status GetAttr(const string& attr_name, T* value) const;
+  Status GetAttr(StringPiece attr_name, T* value) const;
 
   // May be used, e.g., to get GPU handles, etc.
   // TODO(tucker): Add example usage.
@@ -485,6 +495,8 @@ class OpKernelContext {
     }
 
     bool track_allocations = false;
+    bool log_memory = false;
+    bool record_tensor_accesses = false;
 
     // Array indexed by output number for this node
     const AllocatorAttributes* output_attr_array = nullptr;
@@ -498,6 +510,12 @@ class OpKernelContext {
     // Mechanism used by this op kernel invocation to communicate with
     // computations running on other devices.
     Rendezvous* rendezvous = nullptr;
+
+    // The session state for this op.
+    SessionState* session_state = nullptr;
+
+    // The tensor store for this op.
+    TensorStore* tensor_store = nullptr;
 
     // Mechanism used by this op kernel invocation to register a callback
     // for its cancellation.
@@ -521,6 +539,7 @@ class OpKernelContext {
     // Function call supports.
     FunctionCallFrame* call_frame = nullptr;
     FunctionLibraryRuntime* function_library = nullptr;
+    std::function<void(std::function<void()>)>* runner = nullptr;
 
     // TensorSliceReaderCache support.
     checkpoint::TensorSliceReaderCacheWrapper* slice_reader_cache = nullptr;
@@ -557,14 +576,14 @@ class OpKernelContext {
   // use mutable_input below.
   // REQUIRES: !IsRefType(input_dtype(index))
   // REQUIRES: the named input must not be a list.
-  Status input(const string& name, const Tensor** tensor);
+  Status input(StringPiece name, const Tensor** tensor);
 
   // Returns the named list-valued immutable input in "list", as
   // defined in the OpDef.  If the named output is not list-valued,
   // returns a one-element list. May only be used for non-Ref
   // inputs. For Ref inputs use mutable_input below.
   // REQUIRES: !IsRefType(input_dtype(index))
-  Status input_list(const string& name, OpInputList* list);
+  Status input_list(StringPiece name, OpInputList* list);
 
   // For mutable inputs, use the following together to make sure there
   // is no concurrent access to mutable_input(), e.g.:
@@ -576,7 +595,7 @@ class OpKernelContext {
   // REQUIRES: IsRefType(input_dtype(index))
   // TODO(mrry): Convert this to return Status.
   mutex* input_ref_mutex(int index);
-  Status input_ref_mutex(const string& name, mutex** out_mutex);
+  Status input_ref_mutex(StringPiece name, mutex** out_mutex);
 
   // Returns a mutable input tensor. Must be used to access Ref
   // inputs.  REQUIRES: IsRefType(input_dtype(index)). The caller may
@@ -595,7 +614,7 @@ class OpKernelContext {
   // the input mutex will be acquired before returning the Tensor.
   // REQUIRES: the named input must not be a list.
   // REQUIRES: the named input must be a ref tensor.
-  Status mutable_input(const string& name, Tensor* tensor, bool lock_held);
+  Status mutable_input(StringPiece name, Tensor* tensor, bool lock_held);
 
   // Returns the named list-valued mutable input in "list", as defined
   // in the OpDef.  If the named input is not list-valued, returns a
@@ -603,7 +622,7 @@ class OpKernelContext {
   // stored in the Tensor buffer may be modified, and modifications
   // will be visible to other Ops reading the same ref tensor.
   // REQUIRES: the named input must be a ref tensor.
-  Status mutable_input_list(const string& name, OpMutableInputList* list);
+  Status mutable_input_list(StringPiece name, OpMutableInputList* list);
 
   // Replace the corresponding Ref Input to use the storage buffer
   // used by tensor. If !lock_held the input mutex will be acquired
@@ -615,7 +634,7 @@ class OpKernelContext {
   // buffer used by tensor. If !lock_held the input mutex will be
   // acquired before returning the Tensor.
   // REQUIRES: IsRefType(input_dtype(index)).
-  Status replace_ref_input(const string& name, const Tensor& tensor,
+  Status replace_ref_input(StringPiece name, const Tensor& tensor,
                            bool lock_held);
 
   // Set the output Ref Tensor at output_index to be an alias of the
@@ -646,7 +665,7 @@ class OpKernelContext {
 
   // Returns the named list-valued output in "list", as defined in the OpDef.
   // If the named output is not list-valued, returns a one-element list.
-  Status output_list(const string& name, OpOutputList* list);
+  Status output_list(StringPiece name, OpOutputList* list);
 
   // If output_required(index) returns true, the OpKernel's Compute() method
   // should call allocate_output(index, ...), set_output(index, ...),
@@ -711,7 +730,7 @@ class OpKernelContext {
   // REQUIRES: !IsRefType(expected_output_dtype(index))
   Status allocate_output(int index, const TensorShape& shape,
                          Tensor** tensor) TF_MUST_USE_RESULT;
-  Status allocate_output(const string& name, const TensorShape& shape,
+  Status allocate_output(StringPiece name, const TensorShape& shape,
                          Tensor** tensor) TF_MUST_USE_RESULT;
   // The following methods use the supplied attributes instead of
   // those in output_attr_array. The caller is responsible for
@@ -720,7 +739,7 @@ class OpKernelContext {
   // device. See comment above.
   Status allocate_output(int index, const TensorShape& shape, Tensor** tensor,
                          AllocatorAttributes attr) TF_MUST_USE_RESULT;
-  Status allocate_output(const string& name, const TensorShape& shape,
+  Status allocate_output(StringPiece name, const TensorShape& shape,
                          Tensor** tensor,
                          AllocatorAttributes attr) TF_MUST_USE_RESULT;
 
@@ -765,19 +784,19 @@ class OpKernelContext {
   // output_memory_types[index]. See comment above.
   // TODO(mrry): Convert this to return Status.
   void set_output(int index, const Tensor& tensor);
-  Status set_output(const string& name, const Tensor& tensor);
+  Status set_output(StringPiece name, const Tensor& tensor);
 
   // To output a reference.  Caller retains ownership of mu and tensor_for_ref,
   // and they must outlive all uses within the step. See comment above.
   // REQUIRES: IsRefType(expected_output_dtype(index))
   // TODO(mrry): Convert this to return Status.
   void set_output_ref(int index, mutex* mu, Tensor* tensor_for_ref);
-  Status set_output_ref(const string& name, mutex* mu, Tensor* tensor_for_ref);
+  Status set_output_ref(StringPiece name, mutex* mu, Tensor* tensor_for_ref);
 
   // Returns nullptr if allocate_output() or set_output() have not been called.
   // TODO(mrry): Convert this to return Status.
   Tensor* mutable_output(int index);
-  Status mutable_output(const string& name, Tensor** tensor);
+  Status mutable_output(StringPiece name, Tensor** tensor);
 
   // Transfers ownership of an output tensor to the caller.
   // NOTE: For non-reference outputs, the caller takes responsibility
@@ -785,7 +804,7 @@ class OpKernelContext {
   // responsibility for deletion.
   // TODO(mrry): Convert this to return Status.
   TensorValue release_output(int index);
-  Status release_output(const string& name, TensorValue* value);
+  Status release_output(StringPiece name, TensorValue* value);
 
   // Records device specific state about how the input tensors were
   // computed.
@@ -838,6 +857,12 @@ class OpKernelContext {
   // Rendezvous Send() and Recv().
   Rendezvous* rendezvous() const { return params_->rendezvous; }
 
+  // An op kernel can access the session state it belongs to.
+  SessionState* session_state() const { return params_->session_state; }
+
+  // An op kernel can access the tensor store of the run it belongs to.
+  TensorStore* tensor_store() const { return params_->tensor_store; }
+
   // Function call support.
   //
   // If this kernel invocation is within a function execution,
@@ -848,6 +873,10 @@ class OpKernelContext {
   // library. E.g., CHECK_NOTNULL(function_library())->Run("Foo", ...).
   FunctionLibraryRuntime* function_library() const {
     return params_->function_library;
+  }
+
+  std::function<void(std::function<void()>)>* runner() const {
+    return params_->runner;
   }
 
   // Shared resources accessible to this kernel.
@@ -952,9 +981,11 @@ class OpKernelContext {
   mutable mutex mu_;  // mutable so const accessors can acquire the lock
   gtl::InlinedVector<WrappedAllocator, 4> wrapped_allocators_ GUARDED_BY(mu_);
   gtl::InlinedVector<TensorValue, 4> outputs_;
-  UniqueTensorReferences referenced_tensors_ GUARDED_BY(mu_);
+
+  // Constructed only if <params->record_tensor_accesses>.
+  ManualConstructor<UniqueTensorReferences> referenced_tensors_ GUARDED_BY(mu_);
+
   bool is_output_dead_ = false;
-  bool record_tensor_accesses_ = false;
 
   TF_DISALLOW_COPY_AND_ASSIGN(OpKernelContext);
 };
@@ -1011,6 +1042,10 @@ Status SupportedDeviceTypesForNode(
     const std::vector<DeviceType>& prioritized_types, const NodeDef& def,
     DeviceTypeVector* device_types);
 
+// Returns a message with a description of the kernels registered for op
+// `op_name`.
+string KernelsRegisteredForOp(StringPiece op_name);
+
 // Call once after Op registration has completed.
 Status ValidateKernelRegistrations(const OpRegistryInterface& op_registry);
 
@@ -1019,7 +1054,23 @@ Status ValidateKernelRegistrations(const OpRegistryInterface& op_registry);
 
 // Allow the REGISTER_KERNEL_BUILDER(Name("op_name").Device(...)...) syntax.
 namespace register_kernel {
-typedef ::tensorflow::KernelDefBuilder Name;
+
+class Name : public KernelDefBuilder {
+ public:
+  // With selective registration, kernels whose implementation class is not used
+  // by any kernel are disabled with the SHOULD_REGISTER_OP_KERNEL call in
+  // REGISTER_KERNEL_BUILDER_UNIQ. However, an unused kernel that shares an
+  // implementation class with a used kernel would get through that mechanism.
+  //
+  // This mechanism stops that registration by changing the name of the kernel
+  // for the unused op to one that is ignored by
+  // OpKernelRegistrar::InitInternal.  Note that this method alone is
+  // not sufficient - the compiler can't evaluate the entire KernelDefBuilder at
+  // compilation time, so this method doesn't actually reduce code size.
+  explicit Name(const char* op)
+      : KernelDefBuilder(SHOULD_REGISTER_OP(op) ? op : "_no_register") {}
+};
+
 }  // namespace register_kernel
 
 #define REGISTER_KERNEL_BUILDER(kernel_builder, ...) \
@@ -1028,31 +1079,52 @@ typedef ::tensorflow::KernelDefBuilder Name;
 #define REGISTER_KERNEL_BUILDER_UNIQ_HELPER(ctr, kernel_builder, ...) \
   REGISTER_KERNEL_BUILDER_UNIQ(ctr, kernel_builder, __VA_ARGS__)
 
-#define REGISTER_KERNEL_BUILDER_UNIQ(ctr, kernel_builder, ...)   \
-  static ::tensorflow::kernel_factory::OpKernelRegistrar         \
-      registrar__body__##ctr##__object(                          \
-          ::tensorflow::register_kernel::kernel_builder.Build(), \
-          [](::tensorflow::OpKernelConstruction* context)        \
-              -> ::tensorflow::OpKernel* { return new __VA_ARGS__(context); })
+#define REGISTER_KERNEL_BUILDER_UNIQ(ctr, kernel_builder, ...)          \
+  static ::tensorflow::kernel_factory::OpKernelRegistrar                \
+      registrar__body__##ctr##__object(                                 \
+          SHOULD_REGISTER_OP_KERNEL(#__VA_ARGS__)                       \
+              ? ::tensorflow::register_kernel::kernel_builder.Build()   \
+              : nullptr,                                                \
+          #__VA_ARGS__, [](::tensorflow::OpKernelConstruction* context) \
+                            -> ::tensorflow::OpKernel* {                \
+                              return new __VA_ARGS__(context);          \
+                            });
 
 void* GlobalKernelRegistry();
 
 // If node_def has a corresponding kernel registered on device_type,
-// returns OK and fill in the kernel def.
+// returns OK and fill in the kernel def and kernel_class_name. <def> and
+// <kernel_class_name> may be null.
 Status FindKernelDef(DeviceType device_type, const NodeDef& node_def,
-                     const KernelDef** def);
+                     const KernelDef** def, string* kernel_class_name);
 
 // Treats 'registry_ptr' as a pointer to KernelRegistry. For each kernel 'k'
 // registered with the current library's global kernel registry (obtained by
 // calling GlobalKernelRegistry()), inserts 'k' into registry_ptr.
 extern "C" void RegisterKernels(void* registry_ptr);
 
+// Writes a list of all registered kernels to LOG(INFO), to help users debug
+// missing kernel errors.
+void LogAllRegisteredKernels();
+
 namespace kernel_factory {
 
 class OpKernelRegistrar {
  public:
   typedef OpKernel* (*Factory)(OpKernelConstruction*);
-  OpKernelRegistrar(const KernelDef* kernel_def, Factory factory);
+
+  OpKernelRegistrar(const KernelDef* kernel_def, StringPiece kernel_class_name,
+                    Factory factory) {
+    // Perform the check in the header to allow compile-time optimization
+    // to a no-op, allowing the linker to remove the kernel symbols.
+    if (kernel_def != nullptr) {
+      InitInternal(kernel_def, kernel_class_name, factory);
+    }
+  }
+
+ private:
+  void InitInternal(const KernelDef* kernel_def, StringPiece kernel_class_name,
+                    Factory factory);
 };
 
 }  // namespace kernel_factory
@@ -1061,7 +1133,7 @@ class OpKernelRegistrar {
 // Template and inline method implementations, please ignore
 
 template <class T>
-Status OpKernelConstruction::GetAttr(const string& attr_name, T* value) const {
+Status OpKernelConstruction::GetAttr(StringPiece attr_name, T* value) const {
   return GetNodeAttr(def(), attr_name, value);
 }
 
@@ -1083,18 +1155,18 @@ inline DataType OpKernelContext::expected_output_dtype(int index) const {
 }
 
 inline void OpKernelContext::record_tensor_reference(const Tensor& tensor) {
-  DCHECK(params_->device->RequiresRecordingAccessedTensors() ==
-         record_tensor_accesses_);
-  if (record_tensor_accesses_) {
+  DCHECK_EQ(params_->device->RequiresRecordingAccessedTensors(),
+            params_->record_tensor_accesses);
+  if (params_->record_tensor_accesses) {
     really_record_tensor_reference(tensor);
   }
 }
 
 inline void OpKernelContext::retrieve_accessed_tensors(
     TensorReferenceVector* out_vector) {
-  if (record_tensor_accesses_) {
+  if (params_->record_tensor_accesses) {
     mutex_lock l(mu_);
-    referenced_tensors_.FreezeAndReturnReferences(out_vector);
+    referenced_tensors_->FreezeAndReturnReferences(out_vector);
   }
 }
 
@@ -1217,21 +1289,6 @@ inline void OpOutputList::set_ref(int i, mutex* mu, Tensor* tensor_for_ref) {
 //   OP_REQUIRES_OK(context, status);
 //   ...
 // }
-
-// Declares an op deprecated, and illegal starting at GraphDef version VERSION
-#define OP_DEPRECATED(CTX, VERSION, NOTE)                                      \
-  if ((CTX)->graph_def_version() >= (VERSION)) {                               \
-    ::tensorflow::Status _s(::tensorflow::errors::Unimplemented(               \
-        "Op ", (CTX)->op_def().name(),                                         \
-        " is not available in GraphDef version ", (CTX)->graph_def_version(),  \
-        ". It has been removed in version ", (VERSION), ". ", (NOTE), "."));   \
-    (CTX)->CtxFailure(_s);                                                     \
-    return;                                                                    \
-  } else {                                                                     \
-    LOG(WARNING) << "Op is deprecated."                                        \
-                 << " It will cease to work in GraphDef version " << (VERSION) \
-                 << ". " << (NOTE) << ".";                                     \
-  }
 
 #define OP_REQUIRES(CTX, EXP, STATUS) \
   if (!TF_PREDICT_TRUE(EXP)) {        \

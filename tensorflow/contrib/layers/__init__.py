@@ -1,4 +1,4 @@
-# Copyright 2015 Google Inc. All Rights Reserved.
+# Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,8 +20,19 @@ This package provides several ops that take care of creating variables that are
 used internally in a consistent way and provide the building blocks for many
 common machine learning algorithms.
 
+@@avg_pool2d
+@@batch_norm
 @@convolution2d
+@@convolution2d_in_plane
+@@convolution2d_transpose
+@@flatten
 @@fully_connected
+@@max_pool2d
+@@one_hot_encoding
+@@repeat
+@@separable_convolution2d
+@@stack
+@@unit_norm
 
 Aliases for fully_connected which set a default activation function are
 available: `relu`, `relu6` and `linear`.
@@ -31,8 +42,10 @@ available: `relu`, `relu6` and `linear`.
 Regularization can help prevent overfitting. These have the signature
 `fn(weights)`. The loss is typically added to `tf.GraphKeys.REGULARIZATION_LOSS`
 
+@@apply_regularization
 @@l1_regularizer
 @@l2_regularizer
+@@sum_regularizer
 
 ## Initializers
 
@@ -41,6 +54,13 @@ size, data type, and purpose.
 
 @@xavier_initializer
 @@xavier_initializer_conv2d
+@@variance_scaling_initializer
+
+## Optimization
+
+Optimize weights given a loss.
+
+@@optimize_loss
 
 ## Summaries
 
@@ -56,13 +76,6 @@ The layers module defines convenience functions `summarize_variables`,
 of `summarize_collection` to `VARIABLES`, `WEIGHTS` and `BIASES`, respectively.
 
 @@summarize_activations
-
-## Utilities
-
-@@assert_same_float_dtype
-@@assert_scalar_int
-@@is_numeric_tensor
-
 """
 
 from __future__ import absolute_import
@@ -72,15 +85,7 @@ from __future__ import print_function
 import sys
 
 # pylint: disable=unused-import,wildcard-import
-from tensorflow.contrib.layers.python.framework.tensor_util import *
 from tensorflow.contrib.layers.python.layers import *
-from tensorflow.contrib.layers.python.ops import *
-from tensorflow.contrib.layers.python.ops import loss_ops
 from tensorflow.python.util.all_util import make_all
 
-
-# Include loss_ops to get the symbols in - but they are not documented in main
-# docs yet.
-# TODO(cwhipkey): get the loss_ops documented in the main documentation and do
-# this in a better way.
-__all__ = make_all(__name__, [sys.modules[__name__], loss_ops])
+__all__ = make_all(__name__)

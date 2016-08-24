@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@ limitations under the License.
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/tensor_shape.h"
+#include "tensorflow/core/framework/type_traits.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/kernels/fill_functor.h"
 #include "tensorflow/core/platform/logging.h"
@@ -30,7 +31,6 @@ limitations under the License.
 #include "tensorflow/core/util/work_sharder.h"
 
 #if GOOGLE_CUDA
-#include "tensorflow/core/common_runtime/gpu_device_context.h"
 #include "tensorflow/core/platform/stream_executor.h"
 #endif  // GOOGLE_CUDA
 
@@ -114,15 +114,51 @@ perftools::gputools::DeviceMemory<T> AsDeviceMemory(const T* cuda_memory) {
   perftools::gputools::DeviceMemory<T> typed(wrapped);
   return typed;
 }
+
+class CublasScratchAllocator : public perftools::gputools::ScratchAllocator {
+ public:
+  using Stream = ::perftools::gputools::Stream;
+  using DeviceMemoryBytes = ::perftools::gputools::DeviceMemory<uint8>;
+
+  CublasScratchAllocator(OpKernelContext* context) : context_(context) {}
+
+  int64 GetMemoryLimitInBytes(Stream* stream) override { return -1; }
+
+  perftools::gputools::port::StatusOr<DeviceMemoryBytes> AllocateBytes(
+      Stream* stream, int64 byte_size) override {
+    Tensor temporary_memory;
+
+    Status allocation_status(context_->allocate_temp(
+        DT_UINT8, TensorShape({byte_size}), &temporary_memory));
+    if (!allocation_status.ok()) {
+      return perftools::gputools::port::StatusOr<DeviceMemoryBytes>(
+          DeviceMemoryBytes::MakeFromByteSize(nullptr, 0));
+    }
+    // Hold the reference of the allocated tensors until the end of the
+    // allocator.
+    allocated_tensors_.push_back(temporary_memory);
+    return perftools::gputools::port::StatusOr<DeviceMemoryBytes>(
+        DeviceMemoryBytes::MakeFromByteSize(
+            temporary_memory.flat<uint8>().data(),
+            temporary_memory.flat<uint8>().size()));
+  }
+
+ private:
+  OpKernelContext* context_;
+  std::vector<Tensor> allocated_tensors_;
+};
 }  // namespace
 
 template <typename Scalar>
 struct LaunchBatchMatMul<GPUDevice, Scalar> {
   static void Launch(OpKernelContext* context, const Tensor& in_x,
                      const Tensor& in_y, bool adj_x, bool adj_y, Tensor* out) {
+    constexpr perftools::gputools::blas::Transpose kTranspose =
+        is_complex<Scalar>::value
+            ? perftools::gputools::blas::Transpose::kConjugateTranspose
+            : perftools::gputools::blas::Transpose::kTranspose;
     perftools::gputools::blas::Transpose trans[] = {
-        perftools::gputools::blas::Transpose::kNoTranspose,
-        perftools::gputools::blas::Transpose::kTranspose};
+        perftools::gputools::blas::Transpose::kNoTranspose, kTranspose};
     const uint64 m = in_x.dim_size(adj_x ? 2 : 1);
     const uint64 k = in_x.dim_size(adj_x ? 1 : 2);
     const uint64 n = in_y.dim_size(adj_y ? 1 : 2);
@@ -130,7 +166,7 @@ struct LaunchBatchMatMul<GPUDevice, Scalar> {
     auto blas_transpose_a = trans[adj_x];
     auto blas_transpose_b = trans[adj_y];
 
-    auto* stream = context->op_device_context<GPUDeviceContext>()->stream();
+    auto* stream = context->op_device_context()->stream();
     OP_REQUIRES(context, stream, errors::Internal("No GPU stream available."));
 
     typedef perftools::gputools::DeviceMemory<Scalar> DeviceMemoryType;
@@ -163,12 +199,14 @@ struct LaunchBatchMatMul<GPUDevice, Scalar> {
     // where A, B and C are assumed to be in column major.
     // We want the output to be in row-major, so we can compute
     // C' = B' x A' (' stands for transpose)
+    CublasScratchAllocator scratch_allocator(context);
     bool blas_launch_status =
-        stream->ThenBlasGemmBatched(blas_transpose_b, blas_transpose_a, n, m, k,
-                                    static_cast<Scalar>(1.0), b_ptrs,
-                                    adj_y ? k : n, a_ptrs, adj_x ? m : k,
-                                    static_cast<Scalar>(0.0), c_ptrs, n,
-                                    batch_size)
+        stream
+            ->ThenBlasGemmBatchedWithScratch(
+                blas_transpose_b, blas_transpose_a, n, m, k,
+                static_cast<Scalar>(1.0), b_ptrs, adj_y ? k : n, a_ptrs,
+                adj_x ? m : k, static_cast<Scalar>(0.0), c_ptrs, n, batch_size,
+                &scratch_allocator)
             .ok();
     if (!blas_launch_status) {
       context->SetStatus(errors::Internal(
@@ -200,8 +238,8 @@ class BatchMatMul : public OpKernel {
                                         in1.shape().DebugString()));
     const int ndims = in0.dims();
     OP_REQUIRES(
-        ctx, ndims >= 3,
-        errors::InvalidArgument("In[0] and In[1] ndims must be >= 3: ", ndims));
+        ctx, ndims >= 2,
+        errors::InvalidArgument("In[0] and In[1] ndims must be >= 2: ", ndims));
     TensorShape out_shape;
     for (int i = 0; i < ndims - 2; ++i) {
       OP_REQUIRES(ctx, in0.dim_size(i) == in1.dim_size(i),
@@ -211,7 +249,7 @@ class BatchMatMul : public OpKernel {
                                           in1.shape().DebugString()));
       out_shape.AddDim(in0.dim_size(i));
     }
-    auto n = out_shape.num_elements();
+    auto n = (ndims == 2) ? 1 : out_shape.num_elements();
     auto d0 = in0.dim_size(ndims - 2);
     auto d1 = in0.dim_size(ndims - 1);
     Tensor in0_reshaped;
@@ -264,11 +302,12 @@ REGISTER_CPU(float);
 REGISTER_CPU(double);
 REGISTER_CPU(int32);
 REGISTER_CPU(complex64);
+REGISTER_CPU(complex128);
 
 #ifdef GOOGLE_CUDA
-// TODO(kalakris): The GPU implementation is currently disabled due to issues
-// encountered in practice. See b/24534272.
-// REGISTER_GPU(float);
+REGISTER_GPU(float);
+REGISTER_GPU(complex64);
+REGISTER_GPU(complex128);
 #endif  // GOOGLE_CUDA
 
 #undef REGISTER_CPU

@@ -1,4 +1,4 @@
-/* Copyright 2016 Google Inc. All Rights Reserved.
+/* Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,7 +29,7 @@ namespace tensorflow {
 class GrpcClientCQTag {
  public:
   GrpcClientCQTag(::grpc::ClientContext* context, StatusCallback cb)
-      : context_(context), cb_(cb) {}
+      : context_(context), cb_(std::move(cb)) {}
   ~GrpcClientCQTag() { delete context_; }
 
   void OnCompleted(bool ok) {

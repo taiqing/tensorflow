@@ -1,4 +1,4 @@
-# Copyright 2015 Google Inc. All Rights Reserved.
+# Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,22 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
 """Gradients for operators defined in nn_ops.py."""
 
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import nn_ops
+from tensorflow.python.ops import sparse_ops
 from tensorflow.python.ops import gen_nn_ops
 
 
 @ops.RegisterGradient("Conv2DBackpropInput")
-def _Conv2DBackpropGrad(op, grad):
+def _Conv2DBackpropInputGrad(op, grad):
   """The derivatives for deconvolution.
 
   Args:
@@ -38,14 +39,95 @@ def _Conv2DBackpropGrad(op, grad):
     the gradients w.r.t. the input and the filter
   """
   return [None,
-          nn_ops.conv2d_backprop_filter(
-              grad, array_ops.shape(op.inputs[1]), op.inputs[2],
-              op.get_attr("strides"), op.get_attr("padding"),
-              op.get_attr("use_cudnn_on_gpu"), op.get_attr("data_format")),
-          nn_ops.conv2d(
-              grad, op.inputs[1], op.get_attr("strides"),
-              op.get_attr("padding"), op.get_attr("use_cudnn_on_gpu"),
-              op.get_attr("data_format"))]
+          nn_ops.conv2d_backprop_filter(grad, array_ops.shape(op.inputs[1]),
+                                        op.inputs[2], op.get_attr("strides"),
+                                        op.get_attr("padding"),
+                                        op.get_attr("use_cudnn_on_gpu"),
+                                        op.get_attr("data_format")),
+          nn_ops.conv2d(grad, op.inputs[1], op.get_attr("strides"),
+                        op.get_attr("padding"), op.get_attr("use_cudnn_on_gpu"),
+                        op.get_attr("data_format"))]
+
+
+@ops.RegisterGradient("Conv2DBackpropFilter")
+def _Conv2DBackpropFilterGrad(op, grad):
+  return [
+      nn_ops.conv2d_backprop_input(
+          array_ops.shape(op.inputs[0]), grad, op.inputs[2],
+          op.get_attr("strides"),
+          op.get_attr("padding"),
+          op.get_attr("use_cudnn_on_gpu"),
+          op.get_attr("data_format")),
+      None,
+      nn_ops.conv2d(
+          op.inputs[0], grad,
+          op.get_attr("strides"),
+          op.get_attr("padding"),
+          op.get_attr("use_cudnn_on_gpu"),
+          op.get_attr("data_format"))
+  ]
+
+
+@ops.RegisterGradient("Conv3D")
+def _Conv3DGrad(op, grad):
+  return [nn_ops.conv3d_backprop_input_v2(array_ops.shape(op.inputs[0]),
+                                          op.inputs[1],
+                                          grad,
+                                          strides=op.get_attr("strides"),
+                                          padding=op.get_attr("padding")),
+          nn_ops.conv3d_backprop_filter_v2(op.inputs[0],
+                                           array_ops.shape(op.inputs[1]),
+                                           grad,
+                                           strides=op.get_attr("strides"),
+                                           padding=op.get_attr("padding"))]
+
+
+@ops.RegisterGradient("Conv3DBackpropInputV2")
+def _Conv3DBackpropInputGrad(op, grad):
+  return [None,
+          nn_ops.conv3d_backprop_filter_v2(grad,
+                                           array_ops.shape(op.inputs[1]),
+                                           op.inputs[2],
+                                           strides=op.get_attr("strides"),
+                                           padding=op.get_attr("padding")),
+          nn_ops.conv3d(grad,
+                        op.inputs[1],
+                        strides=op.get_attr("strides"),
+                        padding=op.get_attr("padding"))]
+
+
+@ops.RegisterGradient("Conv3DBackpropFilterV2")
+def _Conv3DBackpropFilterGrad(op, grad):
+  return [nn_ops.conv3d_backprop_input_v2(array_ops.shape(op.inputs[0]),
+                                          grad,
+                                          op.inputs[2],
+                                          strides=op.get_attr("strides"),
+                                          padding=op.get_attr("padding")),
+          None,
+          nn_ops.conv3d(op.inputs[0],
+                        grad,
+                        strides=op.get_attr("strides"),
+                        padding=op.get_attr("padding"))]
+
+
+@ops.RegisterGradient("AvgPool3D")
+def _AvgPool3DGrad(op, grad):
+  return nn_ops.avg_pool3d_grad(
+      array_ops.shape(op.inputs[0]),
+      grad,
+      ksize=op.get_attr("ksize"),
+      strides=op.get_attr("strides"),
+      padding=op.get_attr("padding"))
+
+
+@ops.RegisterGradient("MaxPool3D")
+def _MaxPool3DGrad(op, grad):
+  return nn_ops.max_pool3d_grad(op.inputs[0],
+                                op.outputs[0],
+                                grad,
+                                ksize=op.get_attr("ksize"),
+                                strides=op.get_attr("strides"),
+                                padding=op.get_attr("padding"))
 
 
 @ops.RegisterGradient("Softmax")
@@ -72,11 +154,27 @@ def _SoftmaxGrad(op, grad_softmax):
   # graph-construction time?  Alternatively: do different things
   # depending on the dimensionality of the input tensors.
   softmax = op.outputs[0]
-  grad_x = ((grad_softmax -
-             array_ops.reshape(math_ops.reduce_sum(grad_softmax * softmax, [1]),
-                               [-1, 1]))
-            * softmax)
+  grad_x = ((grad_softmax - array_ops.reshape(
+      math_ops.reduce_sum(grad_softmax * softmax, [1]), [-1, 1])) * softmax)
   return grad_x
+
+
+@ops.RegisterGradient("LogSoftmax")
+def _LogSoftmaxGrad(op, grad):
+  """The gradient for log_softmax.
+
+      log_softmax = input - log(sum(exp(input))
+      dlog_softmax/dinput = diag - softmax(input)
+
+  Args:
+    op: The log softmax op.
+    grad: The tensor representing the gradient w.r.t. the output.
+
+  Returns:
+    The gradients w.r.t. the input.
+  """
+  softmax = math_ops.exp(op.outputs[0])
+  return grad - math_ops.reduce_sum(grad, 1, keep_dims=True) * softmax
 
 
 @ops.RegisterGradient("BiasAdd")
@@ -126,7 +224,8 @@ def _BiasAddGradV1(unused_bias_op, received_grad):
     the second one for the "bias" input of the BiasOp.
   """
   reduction_dim_tensor = math_ops.range(array_ops.rank(received_grad) - 1)
-  return (received_grad, math_ops.reduce_sum(received_grad, reduction_dim_tensor))
+  return (received_grad, math_ops.reduce_sum(received_grad,
+                                             reduction_dim_tensor))
 
 
 @ops.RegisterGradient("Relu")
@@ -157,8 +256,8 @@ def _SoftsignGrad(op, grad):
 @ops.RegisterGradient("ReluGrad")
 def _ReluGradGrad(op, grad):
   x = op.inputs[1]
-  return (gen_nn_ops._relu_grad(grad, x),
-          array_ops.zeros(shape=array_ops.shape(x), dtype=x.dtype))
+  return (gen_nn_ops._relu_grad(grad, x), array_ops.zeros(
+      shape=array_ops.shape(x), dtype=x.dtype))
 
 
 def _BroadcastMul(vec, mat):
@@ -194,12 +293,10 @@ def _SparseSoftmaxCrossEntropyWithLogitsGrad(op, grad_0, _):
 
 @ops.RegisterGradient("Conv2D")
 def _Conv2DGrad(op, grad):
-  return [nn_ops.conv2d_backprop_input(array_ops.shape(op.inputs[0]),
-                                       op.inputs[1], grad,
-                                       op.get_attr("strides"),
-                                       op.get_attr("padding"),
-                                       op.get_attr("use_cudnn_on_gpu"),
-                                       op.get_attr("data_format")),
+  return [nn_ops.conv2d_backprop_input(
+      array_ops.shape(op.inputs[0]), op.inputs[1], grad, op.get_attr("strides"),
+      op.get_attr("padding"), op.get_attr("use_cudnn_on_gpu"),
+      op.get_attr("data_format")),
           nn_ops.conv2d_backprop_filter(op.inputs[0],
                                         array_ops.shape(op.inputs[1]), grad,
                                         op.get_attr("strides"),
@@ -220,34 +317,48 @@ def _DepthwiseConv2dNativeGrad(op, grad):
   ]
 
 
+@ops.RegisterGradient("Dilation2D")
+def _Dilation2DGrad(op, grad):
+  return [nn_ops.dilation2d_backprop_input(op.inputs[0], op.inputs[1], grad,
+                                           op.get_attr("strides"),
+                                           op.get_attr("rates"),
+                                           op.get_attr("padding")),
+          nn_ops.dilation2d_backprop_filter(op.inputs[0], op.inputs[1], grad,
+                                            op.get_attr("strides"),
+                                            op.get_attr("rates"),
+                                            op.get_attr("padding"))]
+
+
 @ops.RegisterGradient("LRN")
 def _LRNGrad(op, grad):
   depth_radius = op.get_attr("depth_radius")
   bias = op.get_attr("bias")
   alpha = op.get_attr("alpha")
   beta = op.get_attr("beta")
-  return [gen_nn_ops._lrn_grad(grad, op.inputs[0], op.outputs[0],
-                               depth_radius, bias, alpha, beta)]
+  return [gen_nn_ops._lrn_grad(grad, op.inputs[0], op.outputs[0], depth_radius,
+                               bias, alpha, beta)]
 
 
 @ops.RegisterGradient("AvgPool")
 def _AvgPoolGrad(op, grad):
-  return gen_nn_ops._avg_pool_grad(array_ops.shape(op.inputs[0]), grad,
-                                   op.get_attr("ksize"),
-                                   op.get_attr("strides"),
-                                   op.get_attr("padding"),
-                                   data_format=op.get_attr("data_format")
-                                  )
+  return gen_nn_ops._avg_pool_grad(
+      array_ops.shape(op.inputs[0]),
+      grad,
+      op.get_attr("ksize"),
+      op.get_attr("strides"),
+      op.get_attr("padding"),
+      data_format=op.get_attr("data_format"))
 
 
 @ops.RegisterGradient("MaxPool")
 def _MaxPoolGrad(op, grad):
-  return gen_nn_ops._max_pool_grad(op.inputs[0], op.outputs[0], grad,
+  return gen_nn_ops._max_pool_grad(op.inputs[0],
+                                   op.outputs[0],
+                                   grad,
                                    op.get_attr("ksize"),
                                    op.get_attr("strides"),
                                    padding=op.get_attr("padding"),
-                                   data_format=op.get_attr("data_format")
-                                  )
+                                   data_format=op.get_attr("data_format"))
 
 
 @ops.RegisterGradient("BatchNormWithGlobalNormalization")
@@ -289,3 +400,41 @@ def _L2LossGrad(op, grad):
     The gradient, which is (x * grad).
   """
   return op.inputs[0] * grad
+
+
+@ops.RegisterGradient("TopK")
+@ops.RegisterGradient("TopKV2")
+def _TopKGrad(op, grad, _):
+  """Return the gradients for TopK.
+
+  Args:
+    op: The TopKOp for which we need to generate gradients.
+    grad: Tensor. The gradients passed to the TopKOp.
+
+  Returns:
+    A list of two tensors, the first being the gradient w.r.t to the input and
+    TopK, and the second being the gradient w.r.t. to the indices (all zero).
+  """
+  in_shape = array_ops.shape(op.inputs[0])
+  ind_shape = array_ops.shape(op.outputs[1])
+
+  ind_lastdim = array_ops.gather(ind_shape, array_ops.size(ind_shape) - 1)
+  # Flatten indices to 2D.
+  ind_2d = array_ops.reshape(op.outputs[1], array_ops.pack([-1, ind_lastdim]))
+
+  in_lastdim = array_ops.gather(in_shape, array_ops.size(in_shape) - 1)
+  outerdim = array_ops.shape(ind_2d)[0]
+  # Compute linear indices (flattened to 1D).
+  ind = array_ops.reshape(ind_2d + array_ops.expand_dims(
+      math_ops.range(0, outerdim * in_lastdim, in_lastdim), -1), [-1])
+
+  # Substitute grad to appropriate locations and fill the rest with zeros,
+  # finally reshaping it to the original input shape.
+  return [array_ops.reshape(
+      sparse_ops.sparse_to_dense(ind,
+                                 array_ops.reshape(
+                                     math_ops.reduce_prod(in_shape), [1]),
+                                 array_ops.reshape(grad, [-1]),
+                                 validate_indices=False),
+      in_shape), array_ops.zeros(
+          [], dtype=dtypes.int32)]

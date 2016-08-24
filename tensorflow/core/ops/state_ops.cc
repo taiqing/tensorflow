@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,9 +13,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include "tensorflow/core/framework/common_shape_fns.h"
 #include "tensorflow/core/framework/op.h"
 
 namespace tensorflow {
+
+using shape_inference::InferenceContext;
+using shape_inference::Shape;
 
 REGISTER_OP("Variable")
     .Output("ref: Ref(dtype)")
@@ -24,6 +28,7 @@ REGISTER_OP("Variable")
     .Attr("container: string = ''")
     .Attr("shared_name: string = ''")
     .SetIsStateful()
+    .SetShapeFn(shape_inference::UnknownShape)
     .Doc(R"doc(
 Holds state in the form of a tensor that persists across steps.
 
@@ -40,12 +45,35 @@ shared_name: If non-empty, this variable is named in the given bucket
              with this shared_name. Otherwise, the node name is used instead.
 )doc");
 
+REGISTER_OP("IsVariableInitialized")
+    .Input("ref: Ref(dtype)")
+    .Output("is_initialized: bool")
+    .Attr("dtype: type")
+    .SetAllowsUninitializedInput()
+    .SetShapeFn(shape_inference::ScalarShape)
+    .Doc(R"doc(
+Checks whether a tensor has been initialized.
+
+Outputs boolean scalar indicating whether the tensor has been initialized.
+
+ref: Should be from a `Variable` node. May be uninitialized.
+dtype: The type of elements in the variable tensor.
+)doc");
+
 REGISTER_OP("TemporaryVariable")
     .Output("ref: Ref(dtype)")
     .Attr("shape: shape")
     .Attr("dtype: type")
     .Attr("var_name: string = ''")
     .SetIsStateful()
+    .SetShapeFn([](InferenceContext* c) {
+      TensorShapeProto shape_proto;
+      TF_RETURN_IF_ERROR(c->GetAttr("shape", &shape_proto));
+      const Shape* output;
+      TF_RETURN_IF_ERROR(c->MakeShapeFromShapeProto(shape_proto, &output));
+      c->set_output(0, output);
+      return Status::OK();
+    })
     .Doc(R"doc(
 Returns a tensor that may be mutated, but only persists within a single step.
 
@@ -76,6 +104,7 @@ REGISTER_OP("DestroyTemporaryVariable")
     .Output("value: T")
     .Attr("T: type")
     .Attr("var_name: string")
+    .SetShapeFn(shape_inference::UnchangedShape)
     .Doc(R"doc(
 Destroys the temporary variable and returns its final value.
 
@@ -100,6 +129,16 @@ REGISTER_OP("Assign")
     .Attr("validate_shape: bool = true")
     .Attr("use_locking: bool = true")
     .SetAllowsUninitializedInput()
+    .SetShapeFn([](InferenceContext* c) {
+      bool validate_shape;
+      TF_RETURN_IF_ERROR(c->GetAttr("validate_shape", &validate_shape));
+      if (validate_shape) {
+        return shape_inference::MergeBothInputsShapeFn(c);
+      }
+
+      c->set_output(0, c->input(1));
+      return Status::OK();
+    })
     .Doc(R"doc(
 Update 'ref' by assigning 'value' to it.
 
@@ -123,6 +162,7 @@ REGISTER_OP("AssignAdd")
     .Output("output_ref: Ref(T)")
     .Attr("T: numbertype")
     .Attr("use_locking: bool = false")
+    .SetShapeFn(shape_inference::MergeBothInputsShapeFn)
     .Doc(R"doc(
 Update 'ref' by adding 'value' to it.
 
@@ -143,6 +183,7 @@ REGISTER_OP("AssignSub")
     .Output("output_ref: Ref(T)")
     .Attr("T: numbertype")
     .Attr("use_locking: bool = false")
+    .SetShapeFn(shape_inference::MergeBothInputsShapeFn)
     .Doc(R"doc(
 Update 'ref' by subtracting 'value' from it.
 
@@ -157,6 +198,25 @@ output_ref:= Same as "ref".  Returned as a convenience for operations that want
   to use the new value after the variable has been updated.
 )doc");
 
+namespace {
+
+Status ScatterUpdateShape(InferenceContext* c) {
+  const Shape* var_shape = c->input(0);
+  const Shape* indices_shape = c->input(1);
+
+  const Shape* unused_updates_shape;
+  const Shape* concat;
+  const Shape* var_subshape;
+  TF_RETURN_IF_ERROR(c->Subshape(var_shape, 1, &var_subshape));
+  TF_RETURN_IF_ERROR(c->Concatenate(indices_shape, var_subshape, &concat));
+  TF_RETURN_IF_ERROR(c->Merge(c->input(2), concat, &unused_updates_shape));
+
+  c->set_output(0, var_shape);
+  return Status::OK();
+}
+
+}  // namespace
+
 REGISTER_OP("ScatterUpdate")
     .Input("ref: Ref(T)")
     .Input("indices: Tindices")
@@ -165,6 +225,7 @@ REGISTER_OP("ScatterUpdate")
     .Attr("T: type")
     .Attr("Tindices: {int32, int64}")
     .Attr("use_locking: bool = true")
+    .SetShapeFn(ScatterUpdateShape)
     .Doc(R"doc(
 Applies sparse updates to a variable reference.
 
@@ -209,6 +270,7 @@ REGISTER_OP("ScatterAdd")
     .Attr("T: numbertype")
     .Attr("Tindices: {int32, int64}")
     .Attr("use_locking: bool = false")
+    .SetShapeFn(ScatterUpdateShape)
     .Doc(R"doc(
 Adds sparse updates to a variable reference.
 
@@ -252,6 +314,7 @@ REGISTER_OP("ScatterSub")
     .Attr("T: numbertype")
     .Attr("Tindices: {int32, int64}")
     .Attr("use_locking: bool = false")
+    .SetShapeFn(ScatterUpdateShape)
     .Doc(R"doc(
 Subtracts sparse updates to a variable reference.
 
@@ -290,6 +353,12 @@ REGISTER_OP("CountUpTo")
     .Output("output: T")
     .Attr("limit: int")
     .Attr("T: {int32, int64}")
+    .SetShapeFn([](InferenceContext* c) {
+      const Shape* output;
+      TF_RETURN_IF_ERROR(c->WithRank(c->input(0), 0, &output));
+      c->set_output(0, output);
+      return Status::OK();
+    })
     .Doc(R"doc(
 Increments 'ref' until it reaches 'limit'.
 

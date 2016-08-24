@@ -1,4 +1,4 @@
-/* Copyright 2016 Google Inc. All Rights Reserved.
+/* Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-// See docs in ../ops/sdca_ops.cc.
+// See docs in ./ops/sdca_ops.cc.
 
 #define EIGEN_USE_THREADS
 
@@ -28,24 +28,25 @@ limitations under the License.
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
 #include "tensorflow/contrib/linear_optimizer/kernels/hinge-loss.h"
 #include "tensorflow/contrib/linear_optimizer/kernels/logistic-loss.h"
-#include "tensorflow/contrib/linear_optimizer/kernels/resources.h"
 #include "tensorflow/contrib/linear_optimizer/kernels/squared-loss.h"
 #include "tensorflow/core/framework/device_base.h"
 #include "tensorflow/core/framework/kernel_def_builder.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_def_builder.h"
 #include "tensorflow/core/framework/op_kernel.h"
-#include "tensorflow/core/framework/resource_mgr.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/framework/tensor_types.h"
 #include "tensorflow/core/framework/types.h"
+#include "tensorflow/core/kernels/bounds_check.h"
+#include "tensorflow/core/lib/core/coding.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/lib/core/stringpiece.h"
 #include "tensorflow/core/lib/gtl/inlined_vector.h"
 #include "tensorflow/core/lib/hash/hash.h"
 #include "tensorflow/core/lib/strings/stringprintf.h"
+#include "tensorflow/core/platform/fingerprint.h"
 #include "tensorflow/core/platform/mutex.h"
 #include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/util/sparse/group_iterator.h"
@@ -53,416 +54,546 @@ limitations under the License.
 #include "tensorflow/core/util/work_sharder.h"
 
 namespace tensorflow {
+
 namespace {
 
-// A feature group of a single example by this struct.
-struct PerExampleSparseIndicesWeights {
-  // N X 1 vector with feature indices.
-  Eigen::Tensor</*const*/ int64, 1, Eigen::RowMajor> feature_indices;
+using UnalignedFloatVector = TTypes<const float>::UnalignedConstVec;
+using UnalignedInt64Vector = TTypes<const int64>::UnalignedConstVec;
 
-  // N X 1 vector with feature values.
-  TTypes</*const*/ float>::UnalignedVec feature_values;
-
-  // sum squared norm of the features.
-  double norm;
-};
-
-struct Regularizations {
-  float symmetric_l1 = 0;
-  float symmetric_l2 = 0;
-};
-
-struct RegularizationLoss {
-  double l1_loss = 0;
-  double l2_loss = 0;
-};
-
-struct PerExampleData {
+// Statistics computed with input (ModelWeights, Example).
+struct ExampleStatistics {
+  // feature_weights dot feature_values for the example.
   double wx = 0;
-  double norm = 0;
+
+  // sum of squared feature values occurring in the example divided by
+  // L2 * sum(example_weights).
+  double normalized_squared_norm = 0;
 };
 
-// Weights associated with a (sparse or dense) feature group, such that the size
-// of WeightsByGroup is the number of feature groups.
-using WeightsByGroup = std::vector<TTypes<float>::Vec>;
+class Regularizations {
+ public:
+  Regularizations(){};
 
-// SparseExamples represent sparse feature groups of each example.
-using SparseExamples =
-    std::vector<std::unique_ptr<const PerExampleSparseIndicesWeights>>;
-
-// SparseExamples associated with each sparse feature group.
-using SparseExamplesByGroup = std::vector<SparseExamples>;
-
-// Dense features associated with each dense feature group.
-using DenseFeaturesByGroup = std::vector<TTypes<const float>::Vec>;
-
-// Go through the entire training set once, in a parallel and partitioned
-// fashion, so that we create per-example structures. A non-OK return status
-// indicates that the contents of sparse_examples_by_group cannot be trusted or
-// used.
-Status FillSparseExamplesByGroup(
-    const int64 num_sparse_features, const int64 num_examples,
-    const OpInputList& sparse_features_indices_inputs,
-    const OpInputList& sparse_features_values_inputs,
-    const WeightsByGroup& sparse_weights_by_group,
-    const DeviceBase::CpuWorkerThreads& worker_threads,
-    SparseExamplesByGroup* const sparse_examples_by_group) {
-  if (sparse_features_indices_inputs.size() != num_sparse_features ||
-      sparse_features_values_inputs.size() != num_sparse_features ||
-      sparse_weights_by_group.size() != num_sparse_features) {
-    return errors::Internal("Unaligned sparse features.");
+  // Initialize() must be called immediately after construction.
+  Status Initialize(OpKernelConstruction* const context) {
+    TF_RETURN_IF_ERROR(context->GetAttr("l1", &symmetric_l1_));
+    TF_RETURN_IF_ERROR(context->GetAttr("l2", &symmetric_l2_));
+    shrinkage_ = symmetric_l1_ / symmetric_l2_;
+    return Status::OK();
   }
 
-  sparse_examples_by_group->clear();
-  sparse_examples_by_group->resize(num_sparse_features);
+  // Proximal SDCA shrinking for L1 regularization.
+  double Shrink(const double weight) const {
+    const double shrinked = std::max(std::abs(weight) - shrinkage_, 0.0);
+    if (shrinked > 0.0) {
+      return std::copysign(shrinked, weight);
+    }
+    return 0.0;
+  }
 
-  mutex mu;
-  Status result GUARDED_BY(mu);
-  {
-    auto parse_partition = [&](const int64 begin, const int64 end) {
-      // We set the order as [0, 1], which specifies that its row-major
-      // increasing. This means first column has ids which are lexicographically
-      // increasing.
-      static const int64 kIndicesDims = 2;
-      gtl::InlinedVector<int64, 8> order(kIndicesDims);
-      std::iota(order.begin(), order.end(), 0);
-      for (int64 i = begin; i < end; ++i) {
-        if (sparse_features_indices_inputs[i].shape().dims() != kIndicesDims) {
-          mutex_lock l(mu);
-          result = errors::InvalidArgument(strings::Printf(
-              "Indices should have exactly %lld dimensions. Encountered: %d",
-              kIndicesDims, sparse_features_indices_inputs[i].shape().dims()));
-          return;
-        }
+  // Vectorized float variant of the above.
+  Eigen::Tensor<float, 1, Eigen::RowMajor> EigenShrink(
+      const Eigen::Tensor<float, 1, Eigen::RowMajor> weights) const {
+    // Proximal step on the weights which is sign(w)*|w - shrinkage|+.
+    return weights.sign() * ((weights.abs() - weights.constant(shrinkage_))
+                                 .cwiseMax(weights.constant(0.0)));
+  }
 
-        sparse::SparseTensor st(
-            sparse_features_indices_inputs[i], sparse_features_values_inputs[i],
-            sparse_features_indices_inputs[i].shape(), order);
-        (*sparse_examples_by_group)[i] = SparseExamples(num_examples);
-        for (const auto& example_group : st.group({0})) {
-          const TTypes<int64>::UnalignedConstMatrix indices =
-              example_group.indices();
-          const int64 example_index = indices(0, 0);
-          if (example_index < 0 || example_index >= num_examples) {
-            mutex_lock l(mu);
-            result = errors::Internal(strings::Printf(
-                "Example indices should be in [0, %lld). Encountered: %lld",
-                num_examples, example_index));
-            return;
-          }
+  float symmetric_l2() const { return symmetric_l2_; }
 
-          const auto feature_indices = indices.chip</*dim=*/1>(/*offset=*/1);
-          const Eigen::Tensor<int64, 0, Eigen::RowMajor> min_feature_index =
-              feature_indices.minimum();
-          const Eigen::Tensor<int64, 0, Eigen::RowMajor> max_feature_index =
-              feature_indices.maximum();
-          if (min_feature_index() < 0 ||
-              max_feature_index() >= sparse_weights_by_group[i].size()) {
-            mutex_lock l(mu);
-            result = errors::InvalidArgument(strings::Printf(
-                "Feature indices should be in [0, %ld). Encountered "
-                "min:%lld max:%lld for example:%lld",
-                sparse_weights_by_group[i].size(), min_feature_index(),
-                max_feature_index(), example_index));
-            return;
-          }
+ private:
+  float symmetric_l1_ = 0;
+  float symmetric_l2_ = 0;
 
-          const Eigen::Tensor<float, 0, Eigen::RowMajor> norm =
-              example_group.values<float>().square().sum();
-          (*sparse_examples_by_group)[i][example_index].reset(
-              new PerExampleSparseIndicesWeights{
-                  feature_indices, example_group.values<float>(), norm()});
-        }
+  // L1 divided by L2, pre-computed for use during weight shrinking.
+  double shrinkage_ = 0;
+
+  TF_DISALLOW_COPY_AND_ASSIGN(Regularizations);
+};
+
+class ModelWeights;
+
+// Struct describing a single example.
+class Example {
+ public:
+  // Compute dot product between weights, and example feature values. This
+  // method also computes the normalized example norm used in SDCA update.
+  const ExampleStatistics ComputeWxAndWeightedExampleNorm(
+      const int num_partitions, const ModelWeights& model_weights,
+      const Regularizations& regularization) const;
+
+  float example_label() const { return example_label_; }
+
+  float example_weight() const { return example_weight_; }
+
+  double squared_norm() const { return squared_norm_; }
+
+ private:
+  // Sparse features associated with the example.
+  // Indices and Values are the associated feature index, and values. Values
+  // can be optionally absent, in which we case we implicitly assume a value of
+  // 1.0f.
+  struct SparseFeatures {
+    std::unique_ptr<UnalignedInt64Vector> indices;
+    std::unique_ptr<UnalignedFloatVector> values;  // nullptr encodes optional.
+  };
+  std::vector<SparseFeatures> sparse_features_;
+
+  // A dense vector which is a row-slice of the underlying matrix.
+  struct DenseVector {
+    // Returns a row slice from the matrix.
+    Eigen::TensorMap<Eigen::Tensor<const float, 1, Eigen::RowMajor>> row()
+        const {
+      // TensorMap to a row slice of the matrix.
+      return Eigen::TensorMap<Eigen::Tensor<const float, 1, Eigen::RowMajor>>(
+          data_matrix.data() + row_index * data_matrix.dimension(1),
+          data_matrix.dimension(1));
+    }
+
+    const TTypes<float>::ConstMatrix data_matrix;
+    const int64 row_index;
+  };
+  std::vector<std::unique_ptr<DenseVector>> dense_vectors_;
+
+  float example_label_ = 0;
+  float example_weight_ = 0;
+  double squared_norm_ = 0;  // sum squared norm of the features.
+
+  // Examples fills Example in a multi-threaded way.
+  friend class Examples;
+
+  // ModelWeights use each example for model update w += \alpha * x_{i};
+  friend class ModelWeights;
+};
+
+// Weights related to features. For example, say you have two sets of sparse
+// features i.e. age bracket and country, then FeatureWeights hold the
+// parameters for it. We keep track of the original weight passed in and the
+// delta weight which the optimizer learns in each call to the optimizer.
+struct FeatureWeights {
+  // The nominal value of the weight for a feature (indexed by its id).
+  TTypes<const float>::Vec nominals;
+
+  // The accumulated delta weight for a feature (indexed by its id).
+  TTypes<float>::Vec deltas;
+};
+
+// Weights in the model, wraps both current weights, and the delta weights
+// for both sparse and dense features.
+class ModelWeights {
+ public:
+  ModelWeights() {}
+
+  // Go through all the features present in the example, and update the
+  // weights based on the dual delta.
+  void UpdateDeltaWeights(const Eigen::ThreadPoolDevice& device,
+                          const Example& example,
+                          const double normalized_bounded_dual_delta) {
+    // Sparse weights.
+    for (size_t j = 0; j < sparse_weights_.size(); ++j) {
+      const Example::SparseFeatures& sparse_features =
+          example.sparse_features_[j];
+      FeatureWeights* const feature_weights = &sparse_weights_[j];
+      for (int64 k = 0; k < sparse_features.indices->size(); ++k) {
+        const double feature_value = sparse_features.values == nullptr
+                                         ? 1.0
+                                         : (*sparse_features.values)(k);
+        feature_weights->deltas((*sparse_features.indices)(k)) +=
+            feature_value * normalized_bounded_dual_delta;
+      }
+    }
+
+    // Dense weights.
+    for (size_t j = 0; j < dense_weights_.size(); ++j) {
+      const Example::DenseVector& dense_vector = *example.dense_vectors_[j];
+      TTypes<float>::Vec deltas = dense_weights_[j].deltas;
+      deltas.device(device) =
+          deltas +
+          dense_vector.row() * deltas.constant(normalized_bounded_dual_delta);
+    }
+  }
+
+  Status Initialize(OpKernelContext* const context) {
+    OpInputList sparse_weights_inputs;
+    TF_RETURN_IF_ERROR(
+        context->input_list("sparse_weights", &sparse_weights_inputs));
+    OpInputList dense_weights_inputs;
+    TF_RETURN_IF_ERROR(
+        context->input_list("dense_weights", &dense_weights_inputs));
+
+    OpOutputList sparse_weights_outputs;
+    TF_RETURN_IF_ERROR(context->output_list("out_delta_sparse_weights",
+                                            &sparse_weights_outputs));
+
+    OpOutputList dense_weights_outputs;
+    TF_RETURN_IF_ERROR(context->output_list("out_delta_dense_weights",
+                                            &dense_weights_outputs));
+
+    // Reads in the weights, and allocates and initializes the delta weights.
+    const auto intialize_weights = [&](
+        const OpInputList& weight_inputs, OpOutputList* const weight_outputs,
+        std::vector<FeatureWeights>* const feature_weights) {
+      for (int i = 0; i < weight_inputs.size(); ++i) {
+        Tensor* delta_t;
+        weight_outputs->allocate(i, weight_inputs[i].shape(), &delta_t);
+        auto deltas = delta_t->flat<float>();
+        deltas.setZero();
+        feature_weights->emplace_back(
+            FeatureWeights{weight_inputs[i].flat<float>(), deltas});
       }
     };
 
-    // For each column, the cost of parsing it is O(num_examples). We use
-    // num_examples here, as empirically Shard() creates the right amount of
-    // threads based on the problem size.
-    // TODO(rohananil): Tune this as a function of dataset size.
-    const int64 kCostPerUnit = num_examples;
-    Shard(worker_threads.num_threads, worker_threads.workers,
-          num_sparse_features, kCostPerUnit, parse_partition);
+    intialize_weights(sparse_weights_inputs, &sparse_weights_outputs,
+                      &sparse_weights_);
+    intialize_weights(dense_weights_inputs, &dense_weights_outputs,
+                      &dense_weights_);
+
+    return Status::OK();
   }
 
-  return result;
-}
-
-// Compute the shrinkage factor for proximal sdca.
-inline double ShrinkageFactor(const Regularizations& regularizations) {
-  return regularizations.symmetric_l1 / regularizations.symmetric_l2;
-}
-
-// Proximal SDCA shrinking for L1 regularization.
-inline double Shrink(const double weight, const double shrink_by) {
-  const double shrink_weight = std::max(std::abs(weight) - shrink_by, 0.0);
-  if (shrink_weight > 0.0) {
-    return std::copysign(shrink_weight, weight);
+  const std::vector<FeatureWeights>& sparse_weights() const {
+    return sparse_weights_;
   }
-  return 0.0;
-}
 
-// Compute L1 and L2 regularization loss.
-inline RegularizationLoss ComputeRegularizationLoss(
-    const WeightsByGroup& sparse_weights_by_group,
-    const WeightsByGroup& dense_weights_by_group,
-    const Regularizations& regularizations) {
-  RegularizationLoss result;
+  const std::vector<FeatureWeights>& dense_weights() const {
+    return dense_weights_;
+  }
 
-  const double shrink_by = ShrinkageFactor(regularizations);
-  auto accumulate_regularization_loss = [&](const double w) {
-    const double sw = std::abs(Shrink(w, shrink_by));
-    result.l1_loss += sw;
-    result.l2_loss += sw * sw;
-  };
+ private:
+  // TODO(sibyl-Aix6ihai): Refactor this to support both small-batch mode, and large
+  // batch mode, where we use sparse storage (hashmap) vs dense storage
+  // (vectors).
+  std::vector<FeatureWeights> sparse_weights_;
+  std::vector<FeatureWeights> dense_weights_;
 
-  for (const TTypes<float>::Vec weights : sparse_weights_by_group) {
-    for (int64 i = 0; i < weights.size(); ++i) {
-      accumulate_regularization_loss(weights(i));
+  TF_DISALLOW_COPY_AND_ASSIGN(ModelWeights);
+};
+
+// Computes the example statistics for given example, and model. Defined here
+// as we need definition of ModelWeights and Regularizations.
+const ExampleStatistics Example::ComputeWxAndWeightedExampleNorm(
+    const int num_partitions, const ModelWeights& model_weights,
+    const Regularizations& regularization) const {
+  ExampleStatistics result;
+
+  result.normalized_squared_norm =
+      squared_norm_ / regularization.symmetric_l2();
+
+  // Compute the w \dot x.
+
+  // Sparse features contribution.
+  for (size_t j = 0; j < sparse_features_.size(); ++j) {
+    const Example::SparseFeatures& sparse_features = sparse_features_[j];
+    const FeatureWeights& sparse_weights = model_weights.sparse_weights()[j];
+
+    for (int64 k = 0; k < sparse_features.indices->size(); ++k) {
+      const int64 feature_index = (*sparse_features.indices)(k);
+      const double feature_value = sparse_features.values == nullptr
+                                       ? 1.0
+                                       : (*sparse_features.values)(k);
+      const double feature_weight =
+          sparse_weights.nominals(feature_index) +
+          sparse_weights.deltas(feature_index) * num_partitions;
+      result.wx += feature_value * regularization.Shrink(feature_weight);
     }
   }
 
-  for (const TTypes<float>::Vec weights : dense_weights_by_group) {
-    accumulate_regularization_loss(weights(0));
+  // Dense features contribution.
+  for (size_t j = 0; j < dense_vectors_.size(); ++j) {
+    const Example::DenseVector& dense_vector = *dense_vectors_[j];
+    const FeatureWeights& dense_weights = model_weights.dense_weights()[j];
+
+    const Eigen::Tensor<float, 1, Eigen::RowMajor> feature_weights =
+        dense_weights.nominals +
+        dense_weights.deltas * dense_weights.deltas.constant(num_partitions);
+    const Eigen::Tensor<float, 0, Eigen::RowMajor> prediction =
+        (dense_vector.row() * regularization.EigenShrink(feature_weights))
+            .sum();
+    result.wx += prediction();
   }
 
-  result.l1_loss *= regularizations.symmetric_l1;
-  result.l2_loss *= regularizations.symmetric_l2;
   return result;
 }
 
-// Compute PerExampleData which contains the logits, and weighted example norm
-// for a given example_id. Norm is weighted by 1/(lambda*N).
-inline PerExampleData ComputeWxAndWeightedExampleNorm(
-    const int64 example_id,  //
-    const WeightsByGroup& sparse_weights_by_group,
-    const WeightsByGroup& sparse_delta_weights_by_group,
-    const SparseExamplesByGroup& sparse_examples_by_group,
-    const WeightsByGroup& dense_weights_by_group,
-    const WeightsByGroup& dense_delta_weights_by_group,
-    const DenseFeaturesByGroup& dense_features_by_group,
-    const Regularizations& regularizations) {
-  PerExampleData result;
-  const double shrink_by = ShrinkageFactor(regularizations);
-  for (size_t i = 0; i < sparse_examples_by_group.size(); ++i) {
-    const SparseExamples& sparse_indices_values = sparse_examples_by_group[i];
-    const TTypes<float>::Vec weights = sparse_weights_by_group[i];
-    const TTypes<float>::Vec delta_weights = sparse_delta_weights_by_group[i];
-    if (sparse_indices_values[example_id]) {
-      const auto indices = sparse_indices_values[example_id]->feature_indices;
-      const auto values = sparse_indices_values[example_id]->feature_values;
-      for (int64 dim = 0; dim < indices.dimension(0); ++dim) {
-        const int64 index = indices(dim);
-        const double weight = weights(index);
-        const double value = values(dim);
-        result.wx += Shrink(weight + delta_weights(index), shrink_by) * value;
-      }
-      result.norm += sparse_indices_values[example_id]->norm;
-    }
+// Examples contains all the training examples that SDCA uses for a mini-batch.
+class Examples {
+ public:
+  Examples() {}
+
+  // Returns the Example at |example_index|.
+  const Example& example(const int example_index) const {
+    return examples_.at(example_index);
   }
-  for (size_t i = 0; i < dense_features_by_group.size(); ++i) {
-    const double weight = dense_weights_by_group[i](0);
-    const double value = dense_features_by_group[i](example_id);
-    result.wx +=
-        Shrink(weight + dense_delta_weights_by_group[i](0), shrink_by) * value;
-    result.norm += value * value;
+
+  int num_examples() const { return examples_.size(); }
+
+  int num_features() const { return num_features_; }
+
+  // Initialize() must be called immediately after construction.
+  // TODO(sibyl-Aix6ihai): Refactor/shorten this function.
+  Status Initialize(OpKernelContext* const context, const ModelWeights& weights,
+                    int num_sparse_features,
+                    int num_sparse_features_with_values,
+                    int num_dense_features);
+
+ private:
+  // Reads the input tensors, and builds the internal representation for sparse
+  // features per example. This function modifies the |examples| passed in
+  // to build the sparse representations.
+  static Status CreateSparseFeatureRepresentation(
+      const DeviceBase::CpuWorkerThreads& worker_threads, int num_examples,
+      int num_sparse_features, const ModelWeights& weights,
+      const OpInputList& sparse_example_indices_inputs,
+      const OpInputList& sparse_feature_indices_inputs,
+      const OpInputList& sparse_feature_values_inputs,
+      std::vector<Example>* const examples);
+
+  // Reads the input tensors, and builds the internal representation for dense
+  // features per example. This function modifies the |examples| passed in
+  // to build the sparse representations.
+  static Status CreateDenseFeatureRepresentation(
+      const DeviceBase::CpuWorkerThreads& worker_threads, int num_examples,
+      int num_dense_features, const ModelWeights& weights,
+      const OpInputList& dense_features_inputs,
+      std::vector<Example>* const examples);
+
+  // Computes squared example norm per example i.e |x|^2. This function modifies
+  // the |examples| passed in and adds the squared norm per example.
+  static void ComputeSquaredNormPerExample(
+      const DeviceBase::CpuWorkerThreads& worker_threads, int num_examples,
+      int num_sparse_features, int num_dense_features,
+      std::vector<Example>* const examples);
+
+  // All examples in the batch.
+  std::vector<Example> examples_;
+
+  int num_features_ = 0;
+
+  TF_DISALLOW_COPY_AND_ASSIGN(Examples);
+};
+
+Status Examples::Initialize(OpKernelContext* const context,
+                            const ModelWeights& weights,
+                            const int num_sparse_features,
+                            const int num_sparse_features_with_values,
+                            const int num_dense_features) {
+  num_features_ = num_sparse_features + num_dense_features;
+
+  OpInputList sparse_example_indices_inputs;
+  TF_RETURN_IF_ERROR(context->input_list("sparse_example_indices",
+                                         &sparse_example_indices_inputs));
+  OpInputList sparse_feature_indices_inputs;
+  TF_RETURN_IF_ERROR(context->input_list("sparse_feature_indices",
+                                         &sparse_feature_indices_inputs));
+  OpInputList sparse_feature_values_inputs;
+  if (num_sparse_features_with_values > 0) {
+    TF_RETURN_IF_ERROR(context->input_list("sparse_feature_values",
+                                           &sparse_feature_values_inputs));
   }
-  result.norm /= regularizations.symmetric_l2;
-  return result;
+
+  const Tensor* example_weights_t;
+  TF_RETURN_IF_ERROR(context->input("example_weights", &example_weights_t));
+  auto example_weights = example_weights_t->flat<float>();
+
+  if (example_weights.size() >= std::numeric_limits<int>::max()) {
+    return errors::InvalidArgument(strings::Printf(
+        "Too many examples in a mini-batch: %ld > %d", example_weights.size(),
+        std::numeric_limits<int>::max()));
+  }
+
+  // The static_cast here is safe since num_examples can be at max an int.
+  const int num_examples = static_cast<int>(example_weights.size());
+  const Tensor* example_labels_t;
+  TF_RETURN_IF_ERROR(context->input("example_labels", &example_labels_t));
+  auto example_labels = example_labels_t->flat<float>();
+
+  OpInputList dense_features_inputs;
+  TF_RETURN_IF_ERROR(
+      context->input_list("dense_features", &dense_features_inputs));
+
+  examples_.clear();
+  examples_.resize(num_examples);
+  for (int example_id = 0; example_id < num_examples; ++example_id) {
+    Example* const example = &examples_[example_id];
+    example->sparse_features_.resize(num_sparse_features);
+    example->dense_vectors_.resize(num_dense_features);
+    example->example_weight_ = example_weights(example_id);
+    example->example_label_ = example_labels(example_id);
+  }
+  const DeviceBase::CpuWorkerThreads& worker_threads =
+      *context->device()->tensorflow_cpu_worker_threads();
+  TF_RETURN_IF_ERROR(CreateSparseFeatureRepresentation(
+      worker_threads, num_examples, num_sparse_features, weights,
+      sparse_example_indices_inputs, sparse_feature_indices_inputs,
+      sparse_feature_values_inputs, &examples_));
+  TF_RETURN_IF_ERROR(CreateDenseFeatureRepresentation(
+      worker_threads, num_examples, num_dense_features, weights,
+      dense_features_inputs, &examples_));
+  ComputeSquaredNormPerExample(worker_threads, num_examples,
+                               num_sparse_features, num_dense_features,
+                               &examples_);
+  return Status::OK();
 }
 
-// Zeros out all the weights.
-void SetZeroDeltaWeights(WeightsByGroup* const sparse_delta_weights_by_group,
-                         WeightsByGroup* const dense_delta_weights_by_group) {
-  // TODO(rohananil): Parallelize this.
-  for (TTypes<float>::Vec delta_weights : *sparse_delta_weights_by_group) {
-    delta_weights.setZero();
-  }
-  for (TTypes<float>::Vec delta_weights : *dense_delta_weights_by_group) {
-    delta_weights.setZero();
-  }
-}
-
-// Add delta weights to original weights.
-void AddDeltaWeights(const WeightsByGroup& src, WeightsByGroup* const dst) {
-  // TODO(rohananil): Parallelize this.
-  for (size_t group = 0; group < src.size(); ++group) {
-    for (size_t i = 0; i < src[group].size(); ++i) {
-      (*dst)[group](i) += src[group](i);
-    }
-  }
-}
-
-// Apply L1 regularization on the weights,
-void ShrinkWeights(const Regularizations& regularizations,
-                   WeightsByGroup* const sparse_weights_by_group,
-                   WeightsByGroup* const dense_weights_by_group) {
-  // TODO(rohananil): Parallelize shrinking.
-  const double shrink_by = ShrinkageFactor(regularizations);
-  for (TTypes<float>::Vec weights : *sparse_weights_by_group) {
-    for (int64 i = 0; i < weights.size(); ++i) {
-      weights(i) = Shrink(weights(i), shrink_by);
-    }
-  }
-  for (TTypes<float>::Vec weights : *dense_weights_by_group) {
-    weights(0) = Shrink(weights(0), shrink_by);
-  }
-}
-
-void UpdateDeltaWeights(const int64 example_id,
-                        const SparseExamplesByGroup& sparse_examples_by_group,
-                        const DenseFeaturesByGroup& dense_features_by_group,
-                        const double bounded_dual_delta,
-                        const double l2_regularization,
-                        WeightsByGroup* const sparse_delta_weights_by_group,
-                        WeightsByGroup* const dense_delta_weights_by_group) {
-  for (size_t i = 0; i < sparse_examples_by_group.size(); ++i) {
-    const SparseExamples& sparse_examples = sparse_examples_by_group[i];
-    TTypes<float>::Vec delta_weights = (*sparse_delta_weights_by_group)[i];
-    if (sparse_examples[example_id]) {
-      const auto indices = sparse_examples[example_id]->feature_indices;
-      const auto values = sparse_examples[example_id]->feature_values;
-      for (int64 dim = 0; dim < indices.dimension(0); ++dim) {
-        // TODO(rohananil): Atomic updates provide better convergence guarantees
-        // However, casting float to atomic<float> is UB. We may consider
-        // sharded set of locks, or bring primal-dual relationship to consistent
-        // state after several epochs.
-        delta_weights(indices(dim)) +=
-            bounded_dual_delta * values(dim) / l2_regularization;
-      }
-    }
-  }
-  for (size_t i = 0; i < dense_features_by_group.size(); ++i) {
-    const auto values = dense_features_by_group[i];
-    TTypes<float>::Vec delta_weights = (*dense_delta_weights_by_group)[i];
-    // TODO(rohananil): Atomic updates provide better convergence guarantees
-    // However, casting float to atomic<float> is UB. We may consider
-    // sharded set of locks, or bring primal-dual relationship to consistent
-    // state after several epochs.
-    delta_weights(0) +=
-        bounded_dual_delta * values(example_id) / l2_regularization;
-  }
-}
-
-// Atomically add a double to a std::atomic<double>.
-inline void AtomicAdd(const double src, std::atomic<double>* const dst) {
-  // We use a strong version of compare-exchange, as weak version can spuriously
-  // fail.
-  for (double c = dst->load(); !dst->compare_exchange_strong(c, c + src);) {
-  }
-}
-
-WeightsByGroup MakeWeightsFrom(OpMutableInputList* const input_list) {
-  WeightsByGroup result;
-  for (int i = 0; i < input_list->size(); ++i) {
-    result.emplace_back(input_list->at(i, /*lock_held=*/true).flat<float>());
-  }
-  return result;
-}
-
-std::vector<Tensor> MakeTensorsLike(OpMutableInputList* const input_list) {
-  std::vector<Tensor> result;
-  for (int i = 0; i < input_list->size(); ++i) {
-    result.emplace_back(DT_FLOAT,
-                        input_list->at(i, /*lock_held=*/true).shape());
-    result.back().flat<float>().setZero();
-  }
-  return result;
-}
-
-WeightsByGroup MakeDeltaWeightsFrom(std::vector<Tensor>* const tensors) {
-  WeightsByGroup result;
-  for (auto& tensor : *tensors) {
-    result.emplace_back(tensor.flat<float>());
-  }
-  return result;
-}
-
-Status RunTrainStepsForMiniBatch(
-    const int64 num_examples, const TTypes<const string>::Vec example_ids,
-    const TTypes<const float>::Vec example_labels,
-    const TTypes<const float>::Vec example_weights,
-    const DeviceBase::CpuWorkerThreads& worker_threads,
-    const Regularizations& regularizations,
-    const WeightsByGroup& sparse_weights_by_group,
-    const SparseExamplesByGroup& sparse_examples_by_group,
-    const WeightsByGroup& dense_weights_by_group,
-    const DenseFeaturesByGroup& dense_features_by_group,
-    const DualLossUpdater& loss_updater,
-    WeightsByGroup* const sparse_delta_weights_by_group,
-    WeightsByGroup* const dense_delta_weights_by_group,
-    DataByExample* const data_by_example) {
-  // Process examples in parallel, in a partitioned fashion.
+Status Examples::CreateSparseFeatureRepresentation(
+    const DeviceBase::CpuWorkerThreads& worker_threads, const int num_examples,
+    const int num_sparse_features, const ModelWeights& weights,
+    const OpInputList& sparse_example_indices_inputs,
+    const OpInputList& sparse_feature_indices_inputs,
+    const OpInputList& sparse_feature_values_inputs,
+    std::vector<Example>* const examples) {
   mutex mu;
-  Status train_step_status GUARDED_BY(mu);
-  auto train_step = [&](const int64 begin, const int64 end) {
-    for (int64 example_index = begin; example_index < end; ++example_index) {
-      // Get example id, label, and weight.
-      const DataByExample::Key example_key =
-          DataByExample::MakeKey(example_ids(example_index));
-      DataByExample::Data data = data_by_example->Get(example_key);
-      const float example_weight = example_weights(example_index);
-      float example_label = example_labels(example_index);
-      const Status conversion_status =
-          loss_updater.ConvertLabel(&example_label);
-      if (!conversion_status.ok()) {
+  Status result GUARDED_BY(mu);
+  auto parse_partition = [&](const int64 begin, const int64 end) {
+    // The static_cast here is safe since begin and end can be at most
+    // num_examples which is an int.
+    for (int i = static_cast<int>(begin); i < end; ++i) {
+      auto example_indices =
+          sparse_example_indices_inputs[i].template flat<int64>();
+      auto feature_indices =
+          sparse_feature_indices_inputs[i].template flat<int64>();
+
+      // Parse features for each example. Features for a particular example
+      // are at the offsets (start_id, end_id]
+      int start_id = -1;
+      int end_id = 0;
+      for (int example_id = 0; example_id < num_examples; ++example_id) {
+        start_id = end_id;
+        while (end_id < example_indices.size() &&
+               example_indices(end_id) == example_id) {
+          ++end_id;
+        }
+        Example::SparseFeatures* const sparse_features =
+            &(*examples)[example_id].sparse_features_[i];
+        if (start_id < example_indices.size() &&
+            example_indices(start_id) == example_id) {
+          sparse_features->indices.reset(new UnalignedInt64Vector(
+              &(feature_indices(start_id)), end_id - start_id));
+          if (sparse_feature_values_inputs.size() > i) {
+            auto feature_weights =
+                sparse_feature_values_inputs[i].flat<float>();
+            sparse_features->values.reset(new UnalignedFloatVector(
+                &(feature_weights(start_id)), end_id - start_id));
+          }
+          // If features are non empty.
+          if (end_id - start_id > 0) {
+            // TODO(sibyl-Aix6ihai): Write this efficiently using vectorized
+            // operations from eigen.
+            for (int64 k = 0; k < sparse_features->indices->size(); ++k) {
+              const int64 feature_index = (*sparse_features->indices)(k);
+              if (feature_index < 0 ||
+                  feature_index >=
+                      weights.sparse_weights()[i].nominals.size()) {
+                mutex_lock l(mu);
+                result = errors::InvalidArgument(
+                    "Found sparse feature indices out of valid range: ",
+                    (*sparse_features->indices)(k));
+                return;
+              }
+            }
+          }
+        } else {
+          // Add a Tensor that has size 0.
+          sparse_features->indices.reset(
+              new UnalignedInt64Vector(&(feature_indices(0)), 0));
+          // If values exist for this feature group.
+          if (sparse_feature_values_inputs.size() > i) {
+            auto feature_weights =
+                sparse_feature_values_inputs[i].flat<float>();
+            sparse_features->values.reset(
+                new UnalignedFloatVector(&(feature_weights(0)), 0));
+          }
+        }
+      }
+    }
+  };
+  // For each column, the cost of parsing it is O(num_examples). We use
+  // num_examples here, as empirically Shard() creates the right amount of
+  // threads based on the problem size.
+  // TODO(sibyl-Aix6ihai): Tune this as a function of dataset size.
+  const int64 kCostPerUnit = num_examples;
+  Shard(worker_threads.num_threads, worker_threads.workers, num_sparse_features,
+        kCostPerUnit, parse_partition);
+  return result;
+}
+
+Status Examples::CreateDenseFeatureRepresentation(
+    const DeviceBase::CpuWorkerThreads& worker_threads, const int num_examples,
+    const int num_dense_features, const ModelWeights& weights,
+    const OpInputList& dense_features_inputs,
+    std::vector<Example>* const examples) {
+  mutex mu;
+  Status result GUARDED_BY(mu);
+  auto parse_partition = [&](const int64 begin, const int64 end) {
+    // The static_cast here is safe since begin and end can be at most
+    // num_examples which is an int.
+    for (int i = static_cast<int>(begin); i < end; ++i) {
+      auto dense_features = dense_features_inputs[i].template matrix<float>();
+      for (int example_id = 0; example_id < num_examples; ++example_id) {
+        (*examples)[example_id].dense_vectors_[i].reset(
+            new Example::DenseVector{dense_features, example_id});
+      }
+      if (dense_features.dimension(1) !=
+          weights.dense_weights()[i].nominals.size()) {
         mutex_lock l(mu);
-        train_step_status = conversion_status;
-        // Return from this worker thread - the calling thread is
-        // responsible for checking context status and returning on error.
+        result = errors::InvalidArgument(
+            "More dense features than we have parameters for: ",
+            dense_features.dimension(1));
         return;
       }
-
-      // Compute wx, example norm weighted by regularization, dual loss,
-      // primal loss.
-      const PerExampleData per_example_data = ComputeWxAndWeightedExampleNorm(
-          example_index, sparse_weights_by_group,
-          *sparse_delta_weights_by_group, sparse_examples_by_group,
-          dense_weights_by_group, *dense_delta_weights_by_group,
-          dense_features_by_group, regularizations);
-
-      const double primal_loss = loss_updater.ComputePrimalLoss(
-          per_example_data.wx, example_label, example_weight);
-
-      const double dual_loss = loss_updater.ComputeDualLoss(
-          data.dual, example_label, example_weight);
-
-      const double new_dual = loss_updater.ComputeUpdatedDual(
-          example_label, example_weight, data.dual, per_example_data.wx,
-          per_example_data.norm, primal_loss, dual_loss);
-
-      // Compute new weights.
-      const double bounded_dual_delta = (new_dual - data.dual) * example_weight;
-      UpdateDeltaWeights(
-          example_index, sparse_examples_by_group, dense_features_by_group,
-          bounded_dual_delta, regularizations.symmetric_l2,
-          sparse_delta_weights_by_group, dense_delta_weights_by_group);
-
-      // Update example data.
-      data.dual = new_dual;
-      data.primal_loss = primal_loss;
-      data.dual_loss = dual_loss;
-      data.example_weight = example_weight;
-      data_by_example->Set(example_key, data);
     }
-    // TODO(rohananil): We may in the future want to make the primal-dual
-    // relationship consistent as our current updates are not
-    // transactional.
+
   };
-  // TODO(rohananil): Current multiplier 100000 works well empirically
-  // but perhaps we can tune it better.
-  const int64 kCostPerUnit = 100000 * (sparse_examples_by_group.size() +
-                                       dense_features_by_group.size());
+  // TODO(sibyl-Aix6ihai): Tune this as a function of dataset size.
+  const int64 kCostPerUnit = num_examples;
+  Shard(worker_threads.num_threads, worker_threads.workers, num_dense_features,
+        kCostPerUnit, parse_partition);
+  return result;
+}
+
+void Examples::ComputeSquaredNormPerExample(
+    const DeviceBase::CpuWorkerThreads& worker_threads, const int num_examples,
+    const int num_sparse_features, const int num_dense_features,
+    std::vector<Example>* const examples) {
+  // Compute norm of examples.
+  auto compute_example_norm = [&](const int64 begin, const int64 end) {
+    // The static_cast here is safe since begin and end can be at most
+    // num_examples which is an int.
+    for (int example_id = static_cast<int>(begin); example_id < end;
+         ++example_id) {
+      double squared_norm = 0;
+      Example* const example = &(*examples)[example_id];
+      for (int j = 0; j < num_sparse_features; ++j) {
+        const Example::SparseFeatures& sparse_features =
+            example->sparse_features_[j];
+        if (sparse_features.values) {
+          const Eigen::Tensor<float, 0, Eigen::RowMajor> sn =
+              sparse_features.values->square().sum();
+          squared_norm += sn();
+        } else {
+          squared_norm += sparse_features.indices->size();
+        }
+      }
+      for (int j = 0; j < num_dense_features; ++j) {
+        const Eigen::Tensor<float, 0, Eigen::RowMajor> sn =
+            example->dense_vectors_[j]->row().square().sum();
+        squared_norm += sn();
+      }
+      example->squared_norm_ = squared_norm;
+    }
+  };
+  // TODO(sibyl-Aix6ihai): Compute the cost optimally.
+  const int64 kCostPerUnit = num_dense_features + num_sparse_features;
   Shard(worker_threads.num_threads, worker_threads.workers, num_examples,
-        kCostPerUnit, train_step);
-  return train_step_status;
+        kCostPerUnit, compute_example_norm);
 }
 
 }  // namespace
 
-class SdcaSolver : public OpKernel {
+class DistributedSdcaLargeBatchSolver : public OpKernel {
  public:
-  explicit SdcaSolver(OpKernelConstruction* context) : OpKernel(context) {
+  explicit DistributedSdcaLargeBatchSolver(OpKernelConstruction* const context)
+      : OpKernel(context) {
     string loss_type;
     OP_REQUIRES_OK(context, context->GetAttr("loss_type", &loss_type));
     if (loss_type == "logistic_loss") {
@@ -475,232 +606,163 @@ class SdcaSolver : public OpKernel {
       OP_REQUIRES(context, false, errors::InvalidArgument(
                                       "Unsupported loss type: ", loss_type));
     }
-
     OP_REQUIRES_OK(context, context->GetAttr("num_sparse_features",
                                              &num_sparse_features_));
+    OP_REQUIRES_OK(context,
+                   context->GetAttr("num_sparse_features_with_values",
+                                    &num_sparse_features_with_values_));
     OP_REQUIRES_OK(
         context, context->GetAttr("num_dense_features", &num_dense_features_));
     OP_REQUIRES(
         context, num_sparse_features_ + num_dense_features_ > 0,
         errors::InvalidArgument("Requires at least one feature to train."));
 
+    OP_REQUIRES(context, static_cast<int64>(num_sparse_features_) +
+                                 static_cast<int64>(num_dense_features_) <=
+                             std::numeric_limits<int>::max(),
+                errors::InvalidArgument(
+                    strings::Printf("Too many feature groups: %lld > %d",
+                                    static_cast<int64>(num_sparse_features_) +
+                                        static_cast<int64>(num_dense_features_),
+                                    std::numeric_limits<int>::max())));
     OP_REQUIRES_OK(context,
-                   context->GetAttr("l1", &regularizations_.symmetric_l1));
-    OP_REQUIRES_OK(context,
-                   context->GetAttr("l2", &regularizations_.symmetric_l2));
-    // We enforce a minimal l2, required by the algorithm.
-    regularizations_.symmetric_l2 =
-        std::max(regularizations_.symmetric_l2, 1.0f);
-
+                   context->GetAttr("num_partitions", &num_partitions_));
     OP_REQUIRES_OK(context, context->GetAttr("num_inner_iterations",
                                              &num_inner_iterations_));
-
-    // TODO(rohananil): Provide emperical evidence for this. It is better to run
-    // more than one iteration on single mini-batch as we want to spend more
-    // time in compute. SDCA works better with larger mini batches and there
-    // is also recent work that shows its better to reuse old samples than train
-    // on new samples. See: http://arxiv.org/abs/1602.02136.
-    num_inner_iterations_ =
-        std::max(num_inner_iterations_, static_cast<int64>(2));
-    OP_REQUIRES_OK(context, context->GetAttr("container", &container_));
-    OP_REQUIRES_OK(context, context->GetAttr("solver_uuid", &solver_uuid_));
+    OP_REQUIRES_OK(context, regularizations_.Initialize(context));
   }
 
-  void Compute(OpKernelContext* context) override {
-    // Get a handle on a shared container across invocations of this Kernel.
-    // The shared container is intended to maintain state at the example level
-    // across invocations of the kernel on different input data.
-    //
-    // TODO(katsiapis): Replace this in-Kernel data structure with a first class
-    // citizen mutable Dictionary in tensorflow proper, that we will initialize
-    // and update externally.
-    DataByExample* data_by_example = nullptr;
+  // TODO(sibyl-Aix6ihai): Refactor/shorten this function.
+  void Compute(OpKernelContext* const context) override {
+    Examples examples;
+    ModelWeights model_weights;
+    OP_REQUIRES_OK(context, model_weights.Initialize(context));
+
     OP_REQUIRES_OK(context,
-                   context->resource_manager()->LookupOrCreate<DataByExample>(
-                       container_, solver_uuid_, &data_by_example,
-                       [this](DataByExample** ret) {
-                         *ret = new DataByExample(container_, solver_uuid_);
-                         return Status::OK();
-                       }));
+                   examples.Initialize(
+                       context, model_weights, num_sparse_features_,
+                       num_sparse_features_with_values_, num_dense_features_));
+
+    const Tensor* example_state_data_t;
+    OP_REQUIRES_OK(context,
+                   context->input("example_state_data", &example_state_data_t));
+    TensorShape expected_example_state_shape({examples.num_examples(), 4});
     OP_REQUIRES(
-        context, !data_by_example->RefCountIsOne(),
-        errors::Internal("Expected shared-ownership of data_by_example."));
+        context, example_state_data_t->shape() == expected_example_state_shape,
+        errors::InvalidArgument("Expected shape ",
+                                expected_example_state_shape.DebugString(),
+                                " for example_state_data, got ",
+                                example_state_data_t->shape().DebugString()));
 
-    const Tensor* example_weights_t;
-    OP_REQUIRES_OK(context,
-                   context->input("example_weights", &example_weights_t));
-    OP_REQUIRES(context, TensorShapeUtils::IsVector(example_weights_t->shape()),
-                errors::InvalidArgument("example_weights should be a vector."));
-    const auto example_weights = example_weights_t->vec<float>();
+    Tensor mutable_example_state_data_t(*example_state_data_t);
+    auto example_state_data = mutable_example_state_data_t.matrix<float>();
+    context->set_output("out_example_state_data", mutable_example_state_data_t);
 
-    Eigen::Tensor<float, 0, Eigen::RowMajor> example_weights_sum;
-    example_weights_sum.device(context->eigen_cpu_device()) =
-        example_weights.sum();
-    const float weighted_examples = example_weights_sum();
-    const int64 num_examples = example_weights.size();
+    mutex mu;
+    Status train_step_status GUARDED_BY(mu);
+    auto train_step = [&, this](const int64 begin, const int64 end) {
+      // The static_cast here is safe since begin and end can be at most
+      // num_examples which is an int.
+      for (int example_index = static_cast<int>(begin); example_index < end;
+           ++example_index) {
+        const Example& example = examples.example(example_index);
+        const float dual = example_state_data(example_index, 0);
+        const float example_weight = example.example_weight();
+        float example_label = example.example_label();
+        const Status conversion_status =
+            loss_updater_->ConvertLabel(&example_label);
+        if (!conversion_status.ok()) {
+          mutex_lock l(mu);
+          train_step_status = conversion_status;
+          // Return from this worker thread - the calling thread is
+          // responsible for checking context status and returning on error.
+          return;
+        }
 
-    OP_REQUIRES(context, weighted_examples > 0,
-                errors::InvalidArgument("No weighted examples in ",
-                                        num_examples, " training examples"));
+        // Compute wx, example norm weighted by regularization, dual loss,
+        // primal loss.
+        const ExampleStatistics example_statistics =
+            example.ComputeWxAndWeightedExampleNorm(
+                num_partitions_, model_weights, regularizations_);
 
-    OpInputList dense_features_inputs;
-    OP_REQUIRES_OK(
-        context, context->input_list("dense_features", &dense_features_inputs));
+        const double new_dual = loss_updater_->ComputeUpdatedDual(
+            num_partitions_, example_label, example_weight, dual,
+            example_statistics.wx, example_statistics.normalized_squared_norm);
 
-    DenseFeaturesByGroup dense_features_by_group;
-    for (const auto& dense_feature : dense_features_inputs) {
-      dense_features_by_group.emplace_back(dense_feature.vec<float>());
-    }
+        // Compute new weights.
+        const double normalized_bounded_dual_delta =
+            (new_dual - dual) * example_weight /
+            regularizations_.symmetric_l2();
+        model_weights.UpdateDeltaWeights(context->eigen_cpu_device(), example,
+                                         normalized_bounded_dual_delta);
 
-    const Tensor* example_labels_t;
-    OP_REQUIRES_OK(context,
-                   context->input("example_labels", &example_labels_t));
-    OP_REQUIRES(context, TensorShapeUtils::IsVector(example_labels_t->shape()),
-                errors::InvalidArgument("example_labels should be a vector."));
-    const auto example_labels = example_labels_t->vec<float>();
-    OP_REQUIRES(context, example_labels.size() == num_examples,
-                errors::InvalidArgument(strings::Printf(
-                    "The number of example labels (%ld) should match the "
-                    "number of example weights (%lld).",
-                    example_labels.size(), num_examples)));
-
-    const Tensor* example_ids_t;
-    OP_REQUIRES_OK(context, context->input("example_ids", &example_ids_t));
-    OP_REQUIRES(context, TensorShapeUtils::IsVector(example_ids_t->shape()),
-                errors::InvalidArgument("example_ids should be a vector."));
-    const auto example_ids = example_ids_t->vec<string>();
-    OP_REQUIRES(context, example_labels.size() == num_examples,
-                errors::InvalidArgument(strings::Printf(
-                    "The number of example ids (%ld) should match the number "
-                    "of example weights (%lld).",
-                    example_ids.size(), num_examples)));
-    const int64 num_duplicate_example_ids = [&] {
-      // TODO(katsiapis): Benchmark and/or optimize.
-      std::unordered_set<StringPiece, StringPiece::Hasher> unique_ids(
-          example_ids.size());
-      for (size_t i = 0; i < example_ids.size(); ++i) {
-        unique_ids.emplace(example_ids(i));
+        // Update example data.
+        example_state_data(example_index, 0) = new_dual;
+        example_state_data(example_index, 1) = loss_updater_->ComputePrimalLoss(
+            example_statistics.wx, example_label, example_weight);
+        example_state_data(example_index, 2) =
+            loss_updater_->ComputeDualLoss(dual, example_label, example_weight);
+        example_state_data(example_index, 3) = example_weight;
       }
-      return example_ids.size() - unique_ids.size();
-    }();
-    OP_REQUIRES(context, num_duplicate_example_ids == 0,
-                errors::InvalidArgument(strings::Printf(
-                    "Detected %lld duplicates in example_ids, which usually "
-                    "indicates a bug in the input data.",
-                    num_duplicate_example_ids)));
-
-    OpMutableInputList sparse_weights_inputs;
-    OP_REQUIRES_OK(context, context->mutable_input_list(
-                                "sparse_weights", &sparse_weights_inputs));
-
-    WeightsByGroup sparse_weights_by_group =
-        MakeWeightsFrom(&sparse_weights_inputs);
-    std::vector<Tensor> sparse_delta_weights_by_group_backing_store =
-        MakeTensorsLike(&sparse_weights_inputs);
-    WeightsByGroup sparse_delta_weights_by_group =
-        MakeDeltaWeightsFrom(&sparse_delta_weights_by_group_backing_store);
-
-    OpMutableInputList dense_weights_inputs;
-    OP_REQUIRES_OK(context, context->mutable_input_list("dense_weights",
-                                                        &dense_weights_inputs));
-
-    WeightsByGroup dense_weights_by_group =
-        MakeWeightsFrom(&dense_weights_inputs);
-    std::vector<Tensor> dense_delta_weights_by_group_backing_store =
-        MakeTensorsLike(&dense_weights_inputs);
-    WeightsByGroup dense_delta_weights_by_group =
-        MakeDeltaWeightsFrom(&dense_delta_weights_by_group_backing_store);
-
-    OpInputList sparse_features_indices_inputs;
-    OP_REQUIRES_OK(context,
-                   context->input_list("sparse_features_indices",
-                                       &sparse_features_indices_inputs));
-    OpInputList sparse_features_values_inputs;
-    OP_REQUIRES_OK(context,
-                   context->input_list("sparse_features_values",
-                                       &sparse_features_values_inputs));
-    SparseExamplesByGroup sparse_examples_by_group;
-    OP_REQUIRES_OK(
-        context,
-        FillSparseExamplesByGroup(
-            num_sparse_features_, num_examples, sparse_features_indices_inputs,
-            sparse_features_values_inputs, sparse_weights_by_group,
-            *context->device()->tensorflow_cpu_worker_threads(),
-            &sparse_examples_by_group));
-
-    SetZeroDeltaWeights(&sparse_delta_weights_by_group,
-                        &dense_delta_weights_by_group);
-
-    // TODO(rohananil): Provide emperical evidence for this. It is better to run
-    // more than one iteration on single mini-batch as we want to spend more
-    // time in compute. SDCA works better with larger mini batches and there
-    // is also recent work that shows its better to reuse old samples than train
-    // on new samples. See: http://arxiv.org/abs/1602.02136.
-    for (int64 i = 0; i < num_inner_iterations_; ++i) {
-      OP_REQUIRES_OK(
-          context,
-          RunTrainStepsForMiniBatch(
-              num_examples, example_ids, example_labels, example_weights,
-              *context->device()->tensorflow_cpu_worker_threads(),
-              regularizations_, sparse_weights_by_group,
-              sparse_examples_by_group, dense_weights_by_group,
-              dense_features_by_group, *loss_updater_,
-              &sparse_delta_weights_by_group, &dense_delta_weights_by_group,
-              data_by_example));
-    }
-
-    // TODO(rohananil): Change to atomic<float> as we are not exposing delta
-    // weights to users. This will allows us to simplify the code that currently
-    // keeps a backing store for the tensors. This also avoids losing updates
-    // when done in a lockless way.
-    AddDeltaWeights(sparse_delta_weights_by_group, &sparse_weights_by_group);
-    AddDeltaWeights(dense_delta_weights_by_group, &dense_weights_by_group);
-
-    // TODO(katsiapis): Use core::ScopedUnref once it's moved out of internal.
-    data_by_example->Unref();
+    };
+    // TODO(sibyl-Aix6ihai): Tune this properly based on sparsity of the data,
+    // number of cpus, and cost per example.
+    const int64 kCostPerUnit = examples.num_features();
+    const DeviceBase::CpuWorkerThreads& worker_threads =
+        *context->device()->tensorflow_cpu_worker_threads();
+    Shard(worker_threads.num_threads, worker_threads.workers,
+          examples.num_examples(), kCostPerUnit, train_step);
+    OP_REQUIRES_OK(context, train_step_status);
   }
 
  private:
-  // TODO(rohananil): We could use the type-constraint on loss_type, and
+  // TODO(sibyl-Aix6ihai): We could use the type-constraint on loss_type, and
   // template the entire class to avoid the virtual table lookup penalty in
   // the inner loop.
   std::unique_ptr<DualLossUpdater> loss_updater_;
-  int64 num_sparse_features_;
-  int64 num_dense_features_;
+  int num_sparse_features_ = 0;
+  int num_sparse_features_with_values_ = 0;
+  int num_dense_features_ = 0;
+  int num_inner_iterations_ = 0;
+  int num_partitions_ = 0;
   Regularizations regularizations_;
-  int64 num_inner_iterations_;
-  string container_;
-  string solver_uuid_;
 };
-REGISTER_KERNEL_BUILDER(Name("SdcaSolver").Device(DEVICE_CPU), SdcaSolver);
+REGISTER_KERNEL_BUILDER(
+    Name("DistributedSdcaLargeBatchSolver").Device(DEVICE_CPU),
+    DistributedSdcaLargeBatchSolver);
 
 class SdcaShrinkL1 : public OpKernel {
  public:
-  explicit SdcaShrinkL1(OpKernelConstruction* context) : OpKernel(context) {
-    OP_REQUIRES_OK(context,
-                   context->GetAttr("l1", &regularizations_.symmetric_l1));
-    OP_REQUIRES_OK(context,
-                   context->GetAttr("l2", &regularizations_.symmetric_l2));
-    // We enforce a minimal l2, required by the algorithm.
-    regularizations_.symmetric_l2 =
-        std::max(regularizations_.symmetric_l2, 1.0f);
+  explicit SdcaShrinkL1(OpKernelConstruction* const context)
+      : OpKernel(context) {
+    OP_REQUIRES_OK(context, regularizations_.Initialize(context));
   }
 
-  void Compute(OpKernelContext* context) override {
-    OpMutableInputList sparse_weights_inputs;
-    OP_REQUIRES_OK(context, context->mutable_input_list(
-                                "sparse_weights", &sparse_weights_inputs));
-    WeightsByGroup sparse_weights_by_group =
-        MakeWeightsFrom(&sparse_weights_inputs);
+  void Compute(OpKernelContext* const context) override {
+    OpMutableInputList weights_inputs;
+    OP_REQUIRES_OK(context,
+                   context->mutable_input_list("weights", &weights_inputs));
 
-    OpMutableInputList dense_weights_inputs;
-    OP_REQUIRES_OK(context, context->mutable_input_list("dense_weights",
-                                                        &dense_weights_inputs));
-    WeightsByGroup dense_weights_by_group =
-        MakeWeightsFrom(&dense_weights_inputs);
+    auto do_work = [&](const int64 begin, const int64 end) {
+      for (int i = begin; i < end; ++i) {
+        auto prox_w = weights_inputs.at(i, /*lock_held=*/true).flat<float>();
+        prox_w.device(context->eigen_cpu_device()) =
+            regularizations_.EigenShrink(prox_w);
+      }
+    };
 
-    ShrinkWeights(regularizations_, &sparse_weights_by_group,
-                  &dense_weights_by_group);
+    if (weights_inputs.size() > 0) {
+      int64 num_weights = 0;
+      for (int i = 0; i < weights_inputs.size(); ++i) {
+        num_weights += weights_inputs.at(i, /*lock_held=*/true).NumElements();
+      }
+      // TODO(sibyl-Aix6ihai): Tune this value.
+      const int64 kCostPerUnit = (num_weights * 50) / weights_inputs.size();
+      const DeviceBase::CpuWorkerThreads& worker_threads =
+          *context->device()->tensorflow_cpu_worker_threads();
+      Shard(worker_threads.num_threads, worker_threads.workers,
+            weights_inputs.size(), kCostPerUnit, do_work);
+    }
   }
 
  private:
@@ -708,70 +770,41 @@ class SdcaShrinkL1 : public OpKernel {
 };
 REGISTER_KERNEL_BUILDER(Name("SdcaShrinkL1").Device(DEVICE_CPU), SdcaShrinkL1);
 
-class ComputeDualityGap : public OpKernel {
+// Computes platform independent, compact and unique (with very high
+// probability) representation of an example id. It shouldn't be put in
+// persistent storage, as its implementation may change in the future.
+//
+// The current probability of at least one collision for 1B example_ids is
+// approximately 10^-11 (ie 2^60 / 2^97).
+class SdcaFprint : public OpKernel {
  public:
-  explicit ComputeDualityGap(OpKernelConstruction* context)
-      : OpKernel(context) {
-    // TODO(rohananil): Refactor grabbing common attributes across ops related
-    // to sdca.
-    OP_REQUIRES_OK(context,
-                   context->GetAttr("l1", &regularizations_.symmetric_l1));
-    OP_REQUIRES_OK(context,
-                   context->GetAttr("l2", &regularizations_.symmetric_l2));
-    // We enforce a minimal l2, required by the algorithm.
-    regularizations_.symmetric_l2 =
-        std::max(regularizations_.symmetric_l2, 1.0f);
-    OP_REQUIRES_OK(context, context->GetAttr("container", &container_));
-    OP_REQUIRES_OK(context, context->GetAttr("solver_uuid", &solver_uuid_));
-  }
+  explicit SdcaFprint(OpKernelConstruction* const context)
+      : OpKernel(context) {}
 
-  void Compute(OpKernelContext* context) override {
-    DataByExample* data_by_example = nullptr;
-    OP_REQUIRES_OK(context, context->resource_manager()->Lookup<DataByExample>(
-                                container_, solver_uuid_, &data_by_example));
-    OP_REQUIRES(
-        context, !data_by_example->RefCountIsOne(),
-        errors::Internal("Expected shared-ownership of data_by_example."));
+  void Compute(OpKernelContext* const context) override {
+    const Tensor& input = context->input(0);
+    Tensor* out;
+    OP_REQUIRES_OK(context, context->allocate_output(0, input.shape(), &out));
 
-    OpMutableInputList sparse_weights_inputs;
-    OP_REQUIRES_OK(context, context->mutable_input_list(
-                                "sparse_weights", &sparse_weights_inputs));
-    WeightsByGroup sparse_weights_by_group =
-        MakeWeightsFrom(&sparse_weights_inputs);
+    const auto in_values = input.flat<string>();
+    auto out_values = out->flat<string>();
 
-    OpMutableInputList dense_weights_inputs;
-    OP_REQUIRES_OK(context, context->mutable_input_list("dense_weights",
-                                                        &dense_weights_inputs));
-    WeightsByGroup dense_weights_by_group =
-        MakeWeightsFrom(&dense_weights_inputs);
-
-    double example_weight_sum = 0;
-    double total_duality_gap = 0;
-    OP_REQUIRES_OK(context,
-                   data_by_example->Visit([&](const DataByExample::Data& data) {
-                     example_weight_sum += data.example_weight;
-                     total_duality_gap += data.primal_loss + data.dual_loss;
-                   }));
-
-    const RegularizationLoss regularization_loss = ComputeRegularizationLoss(
-        sparse_weights_by_group, dense_weights_by_group, regularizations_);
-    total_duality_gap +=
-        regularization_loss.l2_loss + regularization_loss.l1_loss;
-
-    Tensor* duality_gap_t = nullptr;
-    OP_REQUIRES_OK(context,
-                   context->allocate_output("duality_gap", {}, &duality_gap_t));
-    duality_gap_t->scalar<float>()() = total_duality_gap / example_weight_sum;
-
-    // TODO(katsiapis): Use core::ScopedUnref once it's moved out of internal.
-    data_by_example->Unref();
+    for (int64 i = 0; i < in_values.size(); ++i) {
+      out_values(i) = Fp128ToBinaryString(Fingerprint128(in_values(i)));
+    }
   }
 
  private:
-  Regularizations regularizations_;
-  string container_;
-  string solver_uuid_;
+  // Returns a 12 character binary string of the fprint.
+  // We use 12 of the 16 fingerprint bytes to save memory, in particular in
+  // string implementations that use a short string optimization.
+  static string Fp128ToBinaryString(const Fprint128& fprint) {
+    string result;
+    core::PutFixed64(&result, fprint.low64);
+    core::PutFixed32(&result, fprint.high64);
+    return result;
+  }
 };
-REGISTER_KERNEL_BUILDER(Name("ComputeDualityGap").Device(DEVICE_CPU),
-                        ComputeDualityGap);
+REGISTER_KERNEL_BUILDER(Name("SdcaFprint").Device(DEVICE_CPU), SdcaFprint);
+
 }  // namespace tensorflow

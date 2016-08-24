@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,20 +27,17 @@ var tsProject = ts.createProject('./tsconfig.json', {
 
 
 module.exports = function() {
-  var isComponent = filter(['components/**/*.js']);
-  var isLib = filter(['lib/js/**/*.js']);
-  var isApp = filter(['app/**/*.js']);
-
-  var tsResult = tsProject.src()
-                     .pipe(ts(tsProject));
-  return merge([
-    // Duplicate all component code to live next to the ts file
-    // (makes polymer imports very clean)
-    tsResult.js
-            .pipe(isComponent)
-            .pipe(gulp.dest('.')),
-    tsResult.js
-            .pipe(isLib)
-            .pipe(gulp.dest('.')),
+  var isComponent = filter([
+    'components/tf-*/**/*.ts',
+    'components/vz-*/**/*.ts',
+    'typings/**/*.ts',
+    'components/plottable/plottable.d.ts'
   ]);
+
+  return tsProject.src()
+           .pipe(isComponent)
+           .pipe(ts(tsProject))
+           .js
+            .pipe(gulp.dest('.'));
+
 }
